@@ -1,5 +1,7 @@
-import { and, eq, isNull } from "drizzle-orm";
+import { hasAcceptedSemanticResult } from "./heartbeat-run-summary.js";
+import { and, eq, isNull, or } from "drizzle-orm";
 import { agents, agentWakeupRequests, heartbeatRuns, nativeRunFinalizations, nativeRunResults, type Db } from "@paperclipai/db";
+import { legacyExecutionNeedsReconciliation } from "./legacy-execution-recovery.js";
 import { decideSecondaryAdapterFallback, type SecondaryAdapterFailureReason } from "./secondary-adapter-fallback.js";
 
 /** Internal executor boundary: never accepts a wake payload as authorization. */
@@ -18,13 +20,13 @@ export async function reserveSecondaryAdapterAttempt(db: Db, input: {
       eq(heartbeatRuns.companyId, input.companyId),
       eq(heartbeatRuns.agentId, input.agentId),
     )).for("update");
-    if (!primary) return null;
+    if (!primary || legacyExecutionNeedsReconciliation(primary)) return null;
     const [agent] = await tx.select().from(agents).where(and(
       eq(agents.id, input.agentId), eq(agents.companyId, input.companyId),
     ));
     if (!agent) return null;
     const [successor] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
-      .where(eq(heartbeatRuns.fallbackOfRunId, primary.id)).limit(1);
+      .where(or(eq(heartbeatRuns.fallbackOfRunId, primary.id), eq(heartbeatRuns.retryOfRunId, primary.id))).limit(1);
     const [nativeResult] = await tx.select({ id: nativeRunResults.id }).from(nativeRunResults)
       .where(eq(nativeRunResults.runId, primary.id)).limit(1);
     const [coordinator] = await tx.select().from(nativeRunFinalizations)
@@ -33,7 +35,7 @@ export async function reserveSecondaryAdapterAttempt(db: Db, input: {
       configured: Boolean(agent.secondaryAdapterType),
       alreadyAttempted: Boolean(primary.fallbackOfRunId || primary.retryOfRunId || successor),
       cancelled: !["failed", "timed_out"].includes(primary.status) || ["paused", "terminated", "pending_approval"].includes(agent.status),
-      completed: input.completed || Boolean(nativeResult || coordinator?.resultId),
+      completed: input.completed || hasAcceptedSemanticResult(primary.resultJson) || Boolean(nativeResult || coordinator?.resultId),
       providerStopped: input.providerStopped && (!coordinator || coordinator.phase === "terminal_failure"),
       failureReason: input.failureReason,
     });

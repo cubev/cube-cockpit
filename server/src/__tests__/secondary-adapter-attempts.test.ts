@@ -31,6 +31,7 @@ const support = await getEmbeddedPostgresTestSupport();
       contextSnapshot: { taskKey: "fixture-task", resumeSessionParams: { sessionId: "primary-session" },
         executionContinuation: { attacker: true }, secondaryAdapter: true, paperclipWakePayload: { attested: true } },
       sessionIdBefore: "primary-session", sessionIdAfter: "primary-session",
+      resultJson: options.status === "queued" ? null : { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
     }).returning();
     return { agent, run, input: { companyId, agentId, primaryRunId: run.id, providerStopped: true, completed: false, failureReason: "network" as const } };
   }
@@ -93,6 +94,61 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(runtime).toMatchObject({ adapterType: "codex_local", sessionId: "primary-provider-session", stateJson: { primaryOnly: true } });
     } finally {
       await drainHeartbeatRunsToQuiescence(db, heartbeat);
+      unregisterServerAdapter("claude_local");
+    }
+  });
+
+  it.each([
+    { name: "provider failure", configured: true, primaryFailure: true, stopped: true, secondaryFailure: false, expected: 1 },
+    { name: "primary success", configured: true, primaryFailure: false, stopped: true, secondaryFailure: false, expected: 0 },
+    { name: "no secondary configuration", configured: false, primaryFailure: true, stopped: true, secondaryFailure: false, expected: 0 },
+    { name: "secondary failure exhausts lineage", configured: true, primaryFailure: true, stopped: true, secondaryFailure: true, expected: 1 },
+    { name: "unsafe workspace restoration", configured: true, primaryFailure: true, stopped: true, secondaryFailure: false, ambiguous: true, expected: 0 },
+    { name: "unconfirmed stop", configured: true, primaryFailure: true, stopped: false, secondaryFailure: false, expected: 0 },
+    { name: "pause after provider failure", configured: true, primaryFailure: true, stopped: true, secondaryFailure: false, paused: true, expected: 0 },
+    { name: "accepted result despite failed exit", configured: true, primaryFailure: true, stopped: true, secondaryFailure: false, completed: true, expected: 0 },
+    { name: "cancellation wins terminal state", configured: true, primaryFailure: true, stopped: true, secondaryFailure: false, cancelled: true, expected: 0 },
+    { name: "teardown exception after stopped provider", configured: true, primaryFailure: false, stopped: true, secondaryFailure: false, teardownFailure: true, expected: 0 },
+    { name: "timeout", configured: true, primaryFailure: true, stopped: true, secondaryFailure: false, timeout: true, expected: 1 },
+  ])("automatically dispatches exactly one secondary after $name", async (options) => {
+    const { agent, run } = await fixture({ configured: options.configured, status: "queued" });
+    const primary = vi.fn<ServerAdapterModule["execute"]>().mockImplementation(async (ctx) => {
+      if (options.stopped) await ctx.onProviderStopped?.();
+      if (options.cancelled) await db.update(heartbeatRuns).set({ status: "cancelled" }).where(eq(heartbeatRuns.id, run.id));
+      if (options.teardownFailure) throw new Error("Fixture teardown failed after successful provider turn");
+      if (options.paused) await db.update(agents).set({ status: "paused" }).where(eq(agents.id, agent.id));
+      return { exitCode: options.primaryFailure ? 1 : 0, signal: null, timedOut: Boolean(options.timeout),
+        errorMessage: options.primaryFailure ? "Fixture provider failed" : null,
+        executionRecovery: options.ambiguous ? undefined : { kind: "bootstrap", providerWorkStarted: false },
+        ...(options.ambiguous ? { resultJson: { workspaceRestoreFailure: "restore_unsafe_archive" } } : {}),
+        ...(options.completed ? { resultJson: { nativeResult: { schema: "paperclip.run_result.v1" } } } : {}),
+      };
+    });
+    const secondary = vi.fn<ServerAdapterModule["execute"]>().mockImplementation(async (ctx) => {
+      expect(ctx.config.model).toBe("secondary");
+      expect(ctx.runtime.sessionId).toBeNull();
+      await ctx.onProviderStopped?.();
+      return { exitCode: options.secondaryFailure ? 1 : 0, signal: null, timedOut: false,
+        errorMessage: options.secondaryFailure ? "Fixture secondary failed" : null, summary: "Finished." };
+    });
+    const environment: ServerAdapterModule["testEnvironment"] = async () => ({ adapterType: "fixture", status: "pass", checks: [], testedAt: new Date(0).toISOString() });
+    registerServerAdapter({ type: "codex_local", supportsLocalAgentJwt: false, execute: primary, testEnvironment: environment });
+    registerServerAdapter({ type: "claude_local", supportsLocalAgentJwt: false, execute: secondary, testEnvironment: environment });
+    const heartbeat = heartbeatService(db);
+    try {
+      await heartbeat.resumeQueuedRuns();
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+      expect(primary).toHaveBeenCalledOnce();
+      expect(secondary).toHaveBeenCalledTimes(options.expected);
+      const attempts = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agent.id));
+      expect(attempts).toHaveLength(1 + options.expected);
+      if (options.expected) expect(attempts.find(attempt => attempt.fallbackOfRunId)).toMatchObject({
+        fallbackOfRunId: run.id, executionAdapterType: "claude_local", fallbackReason: options.timeout ? "timeout" : "adapter_failure",
+        status: options.secondaryFailure ? "failed" : "succeeded",
+      });
+    } finally {
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+      unregisterServerAdapter("codex_local");
       unregisterServerAdapter("claude_local");
     }
   });

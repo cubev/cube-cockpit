@@ -1,4 +1,5 @@
-import { resolveSecondaryExecutionAgent } from "./secondary-adapter-attempts.js";
+import { secondaryAdapterFailureReason, type SecondaryAdapterFailureReason } from "./secondary-adapter-fallback.js";
+import { reserveSecondaryAdapterAttempt, resolveSecondaryExecutionAgent } from "./secondary-adapter-attempts.js";
 import { isAiAuthenticationBlocked } from "./ai-auth-failure.js";
 import { CHAT_COMPLETION_WAKE_REASON, prepareChatCompletionTurn, chatCompletionInstruction, isCompletedOnboardingHandoffWake } from "./chat-completion-delivery.js";
 import { AgentDirectoryReuseInvalidatedError, isAgentDirectoryCopy } from "./agent-directory-working-copies.js";
@@ -15291,6 +15292,12 @@ export function heartbeatService(
       delayMs?: number;
     },
   ) {
+    const [secondarySuccessor] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+      .where(eq(heartbeatRuns.fallbackOfRunId, run.id)).limit(1);
+    if (run.fallbackOfRunId || secondarySuccessor) {
+      return { outcome: "not_scheduled" as const, reason: "The secondary adapter attempt exhausted this execution lineage.",
+        errorCode: "secondary_adapter_attempt_exhausted" as const, issueId: readNonEmptyString(run.contextSnapshot?.issueId) };
+    }
     if (Array.isArray(run.contextSnapshot?.chatCompletionDeliveryIds) &&
         run.contextSnapshot.chatCompletionDeliveryIds.some(id => typeof id === "string")) {
       return { outcome: "not_scheduled" as const, reason: "The completion outbox owns this reply's retry budget and publication identity.",
@@ -20201,6 +20208,11 @@ export function heartbeatService(
     }
 
     let legacyAdapterEntered = false;
+    let secondaryFailureReason: SecondaryAdapterFailureReason | null = null;
+    let secondaryProviderStopped = false;
+    let secondaryCompleted = false;
+    let secondaryConfigured = false;
+    let secondaryDispositionDeferred = false;
     let run = await getRun(runId);
     if (!run) return;
     if (run.status !== "queued" && run.status !== "running") return;
@@ -20335,6 +20347,7 @@ export function heartbeatService(
 
     try {
       const storedAgent = await getAgent(run.agentId);
+      secondaryConfigured = Boolean(storedAgent?.secondaryAdapterType) && !run.fallbackOfRunId && !run.retryOfRunId;
       if (!storedAgent) {
         await setRunStatus(runId, "failed", {
           error: "Agent not found",
@@ -22532,6 +22545,7 @@ export function heartbeatService(
               : saved.errorMessage ?? "Instruction edits were not saved."), payload: instructionSave });
       };
       const collectStoppedInstructions = async () => {
+        secondaryProviderStopped = true;
         if (!instructionCopy) return;
         let saved = await instructionCopies.collectStopped({ companyId: agent.companyId, runId: run.id, target: executionTarget });
         // Capture before disposal. Exhausted bounded collection leaves a durable
@@ -24821,6 +24835,13 @@ export function heartbeatService(
             if (!guardedDispatch.dispatched) return;
             adapterResult = await guardedDispatch.resultPromise;
           }
+          // Preserve execution evidence before restore/copy-back/finalization can
+          // transform the result or throw. A successful turn must never replay.
+          secondaryCompleted = Boolean(adapterResult.nativeFinalization) ||
+            hasAcceptedSemanticResult(adapterResult.resultJson) ||
+            (!adapterResult.timedOut && (adapterResult.exitCode ?? 0) === 0 &&
+              !adapterResult.signal && !adapterResult.errorMessage && !adapterResult.errorCode);
+          secondaryFailureReason = secondaryAdapterFailureReason(adapterResult);
           if (instructionSave) adapterResult.resultJson = { ...adapterResult.resultJson, instructionSave };
           adapterResult = applyWorkspaceRestoreFailure(adapterResult);
           // A returned result can include a failed restore. Keep the workspace
@@ -25599,7 +25620,13 @@ export function heartbeatService(
               `[paperclip] Failed to resolve run presentation: ${err instanceof Error ? err.message : String(err)}\n`,
             );
           }
-          if (outcome === "failed" && isMaxTurnExhaustionRun(livenessRun)) {
+          secondaryDispositionDeferred = secondaryConfigured && secondaryProviderStopped &&
+            !secondaryCompleted && secondaryFailureReason !== null &&
+            !legacyExecutionNeedsReconciliation(livenessRun) && livenessRun.runtimeMode !== "native" && ["failed", "timed_out"].includes(livenessRun.status);
+          if (secondaryDispositionDeferred || run.fallbackOfRunId || (secondaryConfigured && secondaryCompleted)) {
+            // The secondary lineage owns this execution budget. Reserve only
+            // after cleanup; never open a competing generic retry here.
+          } else if (outcome === "failed" && isMaxTurnExhaustionRun(livenessRun)) {
             const policy = parseMaxTurnContinuationPolicy(agent);
             if (policy.enabled && policy.maxAttempts > 0) {
               await scheduleBoundedRetryForRun(livenessRun, agent, {
@@ -25642,14 +25669,14 @@ export function heartbeatService(
           );
           const conversationSettled = await settleConversationTurn(db, livenessRun);
           await releaseIssueExecutionAndPromote(livenessRun, {
-            suppressImmediateRecovery: conversationSettled ||
+            suppressImmediateRecovery: secondaryDispositionDeferred || Boolean(run.fallbackOfRunId) || (secondaryConfigured && secondaryCompleted && outcome !== "succeeded") || conversationSettled ||
               readNonEmptyString(
                 parseObject(livenessRun.contextSnapshot).goalControlRequestId,
               ) !== null ||
               parseObject(livenessRun.contextSnapshot)
                 .resumeSessionGoalHeartbeat === true,
           });
-          if (!conversationSettled) {
+          if (!conversationSettled && !secondaryDispositionDeferred && !run.fallbackOfRunId && !(secondaryConfigured && secondaryCompleted && outcome !== "succeeded")) {
             await handleIssueReviewPathDisposition(livenessRun);
             if (livenessRun.runtimeMode !== "native") {
               await recovery.reconcileLegacyContinuation(livenessRun.id);
@@ -26052,16 +26079,18 @@ export function heartbeatService(
           ) {
             await finalizeIssueCommentPolicy(livenessRun, agent);
           }
-          await scheduleInteractionContinuationInfrastructureRetryIfEligible(
-            livenessRun,
-            agent,
-          );
+          secondaryDispositionDeferred = secondaryConfigured && secondaryProviderStopped &&
+            !secondaryCompleted && secondaryFailureReason !== null &&
+            !legacyExecutionNeedsReconciliation(livenessRun) && livenessRun.runtimeMode !== "native" && livenessRun.status === "failed";
+          if (!secondaryDispositionDeferred && !run.fallbackOfRunId) {
+            await scheduleInteractionContinuationInfrastructureRetryIfEligible(livenessRun, agent);
+          }
           await releaseIssueExecutionAndPromote(livenessRun, {
             // Native recovery owns the original heartbeat run through
             // exhaustion. Once its durable coordinator has classified a
             // terminal failure, generic issue recovery must not create a
             // replacement retryOfRunId chain for the same provider work.
-            suppressImmediateRecovery: nativeTerminalFailureCode !== null,
+            suppressImmediateRecovery: secondaryDispositionDeferred || Boolean(run.fallbackOfRunId) || nativeTerminalFailureCode !== null,
           });
           await handleIssueReviewPathDisposition(livenessRun);
 
@@ -26559,6 +26588,22 @@ export function heartbeatService(
         executionControl.finish();
         if (adapterExecutionControls.get(run.id) === executionControl) {
           adapterExecutionControls.delete(run.id);
+        }
+      }
+      if (secondaryDispositionDeferred && latestRun && !shutdownInProgress &&
+          !nativeSessionResumeScheduled && !nativeWorkspaceFinalizeScheduled && !nativeOwnershipHeld &&
+          !executionControl.controller.signal.aborted) {
+        const secondary = await reserveSecondaryAdapterAttempt(db, {
+          companyId: run.companyId, agentId: run.agentId, primaryRunId: run.id,
+          providerStopped: secondaryProviderStopped,
+          completed: secondaryCompleted || hasAcceptedSemanticResult(latestRun.resultJson),
+          failureReason: secondaryFailureReason,
+        });
+        if (secondary) {
+          await appendRunEvent(latestRun, { eventType: "lifecycle", stream: "system", level: "info",
+            message: "Secondary adapter attempt reserved after provider stop and cleanup",
+            payload: { secondaryRunId: secondary.id, reason: secondary.fallbackReason,
+              adapterType: secondary.executionAdapterType } });
         }
       }
       // Terminalization precedes lease and adapter cleanup. Only now is the

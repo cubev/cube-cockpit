@@ -504,3 +504,12 @@ reservation cannot silently disappear. Failed cleanup or an ambiguous storage
 write requires operator reconciliation before an unattached reservation is
 removed. The table stores no response bodies. See `doc/runner-api-tools.md` for
 limits and the operator override.
+
+Secondary execution is reserved after a legacy provider-stop callback and the
+executor's cleanup boundary. Adapter-owned error codes select the failure reason;
+setup, workspace restoration, accepted results, cancellation and unconfirmed
+stop do not authorize replay. The reservation also rejects an existing generic
+retry successor. Native safe replacement can reserve the same secondary lineage
+only after its existing action, workspace, history and ownership proofs pass;
+remote secondary replacement additionally requires bound termination receipts.
+A secondary lineage cannot schedule a generic retry or another native replacement.

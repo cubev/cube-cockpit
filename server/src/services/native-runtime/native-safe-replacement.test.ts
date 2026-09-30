@@ -136,6 +136,30 @@ const support = externalDatabaseUrl
       });
       return { companyId, agentId, issueId, runId };
     }
+    it("uses the secondary adapter only after the native safe replacement proofs", async () => {
+      const source = await seed(1);
+      await db.update(agents).set({ secondaryAdapterType: "claude_local", secondaryAdapterConfig: { model: "secondary" } })
+        .where(eq(agents.id, source.agentId));
+      await reconcileSafeNativeReplacements(db);
+      await reconcileSafeNativeReplacements(db);
+      const attempts = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, source.agentId));
+      expect(attempts).toHaveLength(2);
+      const secondary = attempts.find(run => run.fallbackOfRunId === source.runId)!;
+      expect(secondary).toMatchObject({ status: "scheduled_retry", retryOfRunId: null,
+        executionAdapterType: "claude_local", fallbackReason: "provider", sessionIdBefore: null });
+      expect(secondary.contextSnapshot).not.toHaveProperty("resumeSessionParams");
+      // Even a failed secondary native session cannot open a fresh primary chain.
+      await db.update(heartbeatRuns).set({ status: "failed", runtimeMode: "native", nativeIssueId: source.issueId,
+        runnerProfileJson: { recoveryEventInventoryVersion: 1, nativeExecutionInput: {
+          provider: { kind: "codex" }, workspace: { cwd: tmpdir() },
+        } } }).where(eq(heartbeatRuns.id, secondary.id));
+      await db.insert(nativeRunFinalizations).values({ companyId: source.companyId, issueId: source.issueId,
+        runId: secondary.id, phase: "terminal_failure", attempt: 1, failureCode: "native_provider_terminal_failed",
+        failureDetail: { originalFailureCode: "fixture_checkpoint_unusable" } });
+      await reconcileSafeNativeReplacements(db);
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, source.agentId))).toHaveLength(2);
+    });
+
     it.each(["verified", "unproven", "unknown_action"] as const)(
       "preserves saved work and a queued request at a controlled recovery boundary (%s)",
       async (mode) => {
