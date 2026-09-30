@@ -513,3 +513,11 @@ retry successor. Native safe replacement can reserve the same secondary lineage
 only after its existing action, workspace, history and ownership proofs pass;
 remote secondary replacement additionally requires bound termination receipts.
 A secondary lineage cannot schedule a generic retry or another native replacement.
+
+Configured secondary adapters also make native quota and allowlisted exhausted
+process/timeout failures eligible for safe-replacement inspection. These extra
+candidates require the stopped-session verifier; a failure code alone does not
+authorize replacement. Same-run native resumes do not consume the single
+persisted secondary attempt. Bootstrap failures without an established session
+remain outside this verifier, and unconfigured agents retain their existing
+replacement budget. Budget hard stops still pause the agent before reservation.

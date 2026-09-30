@@ -64,7 +64,8 @@ export async function reconcileSafeNativeReplacements(
         eq(nativeRunFinalizations.phase, "terminal_failure"),
         inArray(
           nativeRunFinalizations.failureCode,
-          ["native_provider_terminal_failed", "native_session_cleanup_quarantined", "provider_transport_failed"],
+          ["native_provider_terminal_failed", "native_session_cleanup_quarantined", "provider_transport_failed",
+            "native_provider_usage_limit", "native_session_retry_exhausted"],
         ),
         isNull(nativeRunFinalizations.resultId),
         sql`coalesce(${nativeRunFinalizations.failureDetail}->>'successorRunId', '') = ''`,
@@ -83,7 +84,14 @@ export async function reconcileSafeNativeReplacements(
       const [configuredAgent] = await db.select().from(agents).where(and(
         eq(agents.id, run.agentId), eq(agents.companyId, run.companyId),
       ));
+      const secondaryOnlyCandidate = ["native_provider_usage_limit", "native_session_retry_exhausted"].includes(coordinator.failureCode ?? "");
+      if (secondaryOnlyCandidate && !configuredAgent?.secondaryAdapterType) continue;
       if (configuredAgent?.secondaryAdapterType && run.retryOfRunId) continue;
+      const sourceFailure = coordinator.failureDetail?.originalFailureCode;
+      if (coordinator.failureCode === "native_session_retry_exhausted" &&
+          !["provider_initialize_timeout", "provider_request_timeout", "provider_process_exited",
+            "provider_stdout_closed", "provider_process_output_closed", "provider_process_status_failed",
+            "provider_transport_failed", "native_runner_process_exited"].includes(String(sourceFailure))) continue;
       const execution = record(
         record(run.runnerProfileJson).nativeExecutionInput,
       );
@@ -236,7 +244,10 @@ export async function reconcileSafeNativeReplacements(
         effectInventoryComplete:
           Boolean(stoppedSession) || (record(run.runnerProfileJson).recoveryEventInventoryVersion === 1 &&
           record(execution.provider).kind === "codex"),
-        attempts: coordinator.attempt,
+        // Same-run native resumes consumed the native recovery budget, not
+        // the separately persisted, single secondary attempt. Reservation
+        // rejects any existing fallback or generic successor atomically.
+        attempts: configuredAgent?.secondaryAdapterType ? 1 : coordinator.attempt,
         invocations,
         apiReceipts: record(record(run.resultJson).apiToolReceipts),
         uncertainProviderActions,
@@ -326,6 +337,11 @@ export async function reconcileSafeNativeReplacements(
           .from(nativeRunFinalizations)
           .where(eq(nativeRunFinalizations.runId, run.id))
           .for("update");
+        const [executionAgent] = await tx.select().from(agents).where(and(
+          eq(agents.id, run.agentId), eq(agents.companyId, run.companyId),
+        ));
+        const useSecondary = Boolean(executionAgent?.secondaryAdapterType);
+        if (secondaryOnlyCandidate && !useSecondary) return false;
         if (
           !task ||
           task.assigneeAgentId !== run.agentId ||
@@ -337,7 +353,7 @@ export async function reconcileSafeNativeReplacements(
           current.failureCode !== coordinator.failureCode ||
           current.failureDetail?.successorRunId ||
           current.failureDetail?.replacementDenied ||
-          current.attempt >= 3
+          (!useSecondary && current.attempt >= 3)
         )
           return false;
         if (task.status === "blocked") {
@@ -361,10 +377,6 @@ export async function reconcileSafeNativeReplacements(
           if (!currentRun || currentRun.status !== "failed" || currentRun.runnerInstanceId !== run.runnerInstanceId ||
               currentRun.nativeSessionId !== run.nativeSessionId || currentRun.processPid || currentRun.processGroupId) return false;
         }
-        const [executionAgent] = await tx.select().from(agents).where(and(
-          eq(agents.id, run.agentId), eq(agents.companyId, run.companyId),
-        ));
-        const useSecondary = Boolean(executionAgent?.secondaryAdapterType);
         // An automatic retry already consumed the primary failure's budget.
         // It cannot manufacture a new primary -> secondary pair.
         if (useSecondary && run.retryOfRunId) return false;
@@ -392,7 +404,10 @@ export async function reconcileSafeNativeReplacements(
         }
         const secondary = useSecondary ? await reserveSecondaryAdapterAttempt(tx as unknown as Db, {
           companyId: run.companyId, agentId: run.agentId, primaryRunId: run.id,
-          providerStopped: true, completed: false, failureReason: "provider",
+          providerStopped: true, completed: false, failureReason:
+            current.failureCode === "native_provider_usage_limit" ? "quota" :
+              ["provider_initialize_timeout", "provider_request_timeout"].includes(String(current.failureDetail?.originalFailureCode))
+                ? "timeout" : "provider",
         }) : null;
         if (useSecondary && !secondary) throw new Error("secondary_native_attempt_not_admitted");
         const successorRunId = secondary?.id ?? randomUUID();

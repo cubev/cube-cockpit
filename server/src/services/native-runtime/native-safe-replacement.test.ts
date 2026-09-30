@@ -160,6 +160,32 @@ const support = externalDatabaseUrl
       expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, source.agentId))).toHaveLength(2);
     });
 
+    it.each([
+      { code: "native_provider_usage_limit", sourceCode: "usageLimitExceeded", reason: "quota" },
+      { code: "native_session_retry_exhausted", sourceCode: "provider_request_timeout", reason: "timeout" },
+      { code: "native_session_retry_exhausted", sourceCode: "provider_initialize_timeout", reason: "timeout" },
+      { code: "native_session_retry_exhausted", sourceCode: "provider_process_exited", reason: "provider" },
+    ])("requires stopped-session proof for secondary $sourceCode", async ({ code, sourceCode, reason }) => {
+      const source = await seed(code === "native_session_retry_exhausted" ? 3 : 1);
+      await db.update(nativeRunFinalizations).set({ failureCode: code,
+        failureDetail: { originalFailureCode: sourceCode } }).where(eq(nativeRunFinalizations.runId, source.runId));
+      // Additional failure classes must leave unconfigured agents unchanged.
+      await reconcileSafeNativeReplacements(db);
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, source.agentId))).toHaveLength(1);
+      await db.update(agents).set({ secondaryAdapterType: "claude_local", secondaryAdapterConfig: { model: "secondary" } })
+        .where(eq(agents.id, source.agentId));
+      await reconcileSafeNativeReplacements(db, new Date(), { verifyStoppedSession: async () => null });
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, source.agentId))).toHaveLength(1);
+      // Scheduler boundary injection; executor proof is covered separately.
+      await reconcileSafeNativeReplacements(db, new Date(), { verifyStoppedSession: async () => ({
+        evidence: { completedTaskControlCallIds: [] }, retire: () => true,
+      }) });
+      await reconcileSafeNativeReplacements(db);
+      const attempts = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, source.agentId));
+      expect(attempts).toHaveLength(2);
+      expect(attempts.find(run => run.fallbackOfRunId)).toMatchObject({ fallbackReason: reason, executionAdapterType: "claude_local" });
+    });
+
     it.each(["verified", "unproven", "unknown_action"] as const)(
       "preserves saved work and a queued request at a controlled recovery boundary (%s)",
       async (mode) => {

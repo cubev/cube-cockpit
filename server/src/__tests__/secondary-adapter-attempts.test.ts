@@ -1,10 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { and, eq } from "drizzle-orm";
-import { agents, agentRuntimeState, agentWakeupRequests, companies, createDb, heartbeatRuns } from "@paperclipai/db";
+import { agents, agentRuntimeState, agentWakeupRequests, companies, costEvents, budgetPolicies, createDb, heartbeatRuns } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { reserveSecondaryAdapterAttempt, resolveSecondaryExecutionAgent } from "../services/secondary-adapter-attempts.js";
 
+import { budgetService } from "../services/budgets.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { registerServerAdapter, unregisterServerAdapter, type ServerAdapterModule } from "../adapters/index.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
@@ -109,6 +110,7 @@ const support = await getEmbeddedPostgresTestSupport();
     { name: "accepted result despite failed exit", configured: true, primaryFailure: true, stopped: true, secondaryFailure: false, completed: true, expected: 0 },
     { name: "cancellation wins terminal state", configured: true, primaryFailure: true, stopped: true, secondaryFailure: false, cancelled: true, expected: 0 },
     { name: "teardown exception after stopped provider", configured: true, primaryFailure: false, stopped: true, secondaryFailure: false, teardownFailure: true, expected: 0 },
+    { name: "budget exhausted after provider failure", configured: true, primaryFailure: true, stopped: true, secondaryFailure: false, budgetExhausted: true, expected: 0 },
     { name: "timeout", configured: true, primaryFailure: true, stopped: true, secondaryFailure: false, timeout: true, expected: 1 },
   ])("automatically dispatches exactly one secondary after $name", async (options) => {
     const { agent, run } = await fixture({ configured: options.configured, status: "queued" });
@@ -116,6 +118,13 @@ const support = await getEmbeddedPostgresTestSupport();
       if (options.stopped) await ctx.onProviderStopped?.();
       if (options.cancelled) await db.update(heartbeatRuns).set({ status: "cancelled" }).where(eq(heartbeatRuns.id, run.id));
       if (options.teardownFailure) throw new Error("Fixture teardown failed after successful provider turn");
+      if (options.budgetExhausted) {
+        await db.insert(budgetPolicies).values({ companyId: agent.companyId, scopeType: "agent", scopeId: agent.id,
+          windowKind: "calendar_month_utc", amount: 1, notifyEnabled: false });
+        const [cost] = await db.insert(costEvents).values({ companyId: agent.companyId, agentId: agent.id,
+          heartbeatRunId: run.id, provider: "fixture", model: "primary", costCents: 1, occurredAt: new Date() }).returning();
+        await budgetService(db).evaluateCostEvent(cost);
+      }
       if (options.paused) await db.update(agents).set({ status: "paused" }).where(eq(agents.id, agent.id));
       return { exitCode: options.primaryFailure ? 1 : 0, signal: null, timedOut: Boolean(options.timeout),
         errorMessage: options.primaryFailure ? "Fixture provider failed" : null,
@@ -142,6 +151,10 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(secondary).toHaveBeenCalledTimes(options.expected);
       const attempts = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agent.id));
       expect(attempts).toHaveLength(1 + options.expected);
+      if (options.budgetExhausted) {
+        const [pausedAgent] = await db.select().from(agents).where(eq(agents.id, agent.id));
+        expect(pausedAgent).toMatchObject({ status: "paused", pauseReason: "budget" });
+      }
       if (options.expected) expect(attempts.find(attempt => attempt.fallbackOfRunId)).toMatchObject({
         fallbackOfRunId: run.id, executionAdapterType: "claude_local", fallbackReason: options.timeout ? "timeout" : "adapter_failure",
         status: options.secondaryFailure ? "failed" : "succeeded",
