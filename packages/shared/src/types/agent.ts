@@ -94,6 +94,8 @@ export interface Agent {
   capabilities: string | null;
   adapterType: AgentAdapterType;
   adapterConfig: Record<string, unknown>;
+  secondaryAdapterType?: AgentAdapterType | null;
+  secondaryAdapterConfig?: Record<string, unknown> | null;
   runtimeConfig: AgentRuntimeConfig;
   defaultEnvironmentId?: string | null;
   budgetMonthlyCents: number;

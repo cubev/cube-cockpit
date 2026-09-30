@@ -253,6 +253,23 @@ Triage writes serialize on the company and attention-source identity so concurre
 
 ## Native runner persistence
 
+Secondary adapter configuration uses nullable `agents.secondary_adapter_type`
+and `secondary_adapter_config` columns. Historical agents remain unconfigured.
+These storage columns alone do not enable fallback or add an API configuration
+surface; configuration writes must use the normal secret normalization and
+redaction paths before runtime rollout.
+
+`heartbeat_runs.fallback_of_run_id` records server-owned attempt lineage,
+separately from generic retries and wake context. A partial unique index admits
+at most one secondary run per predecessor; a composite foreign key binds both
+runs to the same company and agent, and a check rejects self-links. Runtime
+scheduling must still reject chains, verify provider shutdown and completion,
+and claim lineage with the issue execution lock in one transaction. The database
+constraint alone is not fallback authorization. Delete related runs together
+when cleaning up an agent/company. Nullable `execution_adapter_type` and
+`execution_model` record the selected execution configuration, while
+`fallback_reason` records the switch reason without credentials.
+
 Native runner state is additive to the existing heartbeat tables. Every existing
 `heartbeat_runs` row defaults to `runtime_mode = 'legacy'`; adding these columns
 does not select the native runtime or start a runner process. Native execution can

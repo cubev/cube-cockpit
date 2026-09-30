@@ -154,6 +154,10 @@ export interface GitWorktreeBranchIncoherenceEvidence {
 }
 
 export interface HeartbeatRun {
+  fallbackOfRunId?: string | null;
+  fallbackReason?: string | null;
+  executionAdapterType?: string | null;
+  executionModel?: string | null;
   execution?: import("./execution-projection.js").ExecutionProjection | null;
   id: string;
   companyId: string;
