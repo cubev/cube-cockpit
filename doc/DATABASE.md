@@ -273,7 +273,17 @@ and claim lineage with the issue execution lock in one transaction. The database
 constraint alone is not fallback authorization. Delete related runs together
 when cleaning up an agent/company. Nullable `execution_adapter_type` and
 `execution_model` record the selected execution configuration, while
-`fallback_reason` records the switch reason without credentials.
+`fallback_reason` records the switch reason without credentials. The heartbeat
+captures the resolved adapter and configured model before dispatch and replaces
+the model with the provider-reported model on completion. The run drill-down
+shows this immutable execution metadata and links the fallback predecessor.
+The internal attempt reservation serializes on the primary row and creates the
+secondary run and wake in one transaction. It refuses secondary/retry ancestors,
+accepted native results, unconfirmed provider stops and paused agents. Reserved
+attempts choose their adapter before normal admission and secret resolution;
+secondary secrets use the secondary path prefix. Primary runtime sessions and
+task sessions are never passed to or overwritten by a secondary attempt.
+Automatic failure-to-reservation dispatch is still pending integration.
 
 Native runner state is additive to the existing heartbeat tables. Every existing
 `heartbeat_runs` row defaults to `runtime_mode = 'legacy'`; adding these columns

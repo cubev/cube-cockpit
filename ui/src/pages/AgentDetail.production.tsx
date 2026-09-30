@@ -3556,6 +3556,21 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
                 {run.signal && <span className="text-muted-foreground ml-1">(signal: {run.signal})</span>}
               </div>
             )}
+            {run.executionAdapterType && (
+              <div className="text-xs text-muted-foreground">
+                Adapter: <span className="font-mono">{run.executionAdapterType}</span>
+                {run.executionModel && <> · Model: <span className="font-mono">{run.executionModel}</span></>}
+              </div>
+            )}
+            {run.fallbackOfRunId && (
+              <div className="text-xs text-muted-foreground">
+                Secondary attempt after{" "}
+                <Link to={`/agents/${agentRouteId}/runs/${run.fallbackOfRunId}`} className="font-mono text-foreground hover:underline">
+                  {run.fallbackOfRunId.slice(0, 8)}
+                </Link>
+                {run.fallbackReason && <> · {run.fallbackReason.replaceAll("_", " ")}</>}
+              </div>
+            )}
             {retryState && (
               <div className="rounded-md border border-border/70 bg-accent/20 px-3 py-2 text-xs leading-5">
                 <div className="flex flex-wrap items-center gap-2">
