@@ -1592,6 +1592,40 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
           )}
         </div>
         <div className={cn(cards ? "border border-border rounded-lg p-4 space-y-3" : "px-4 pb-3 space-y-3")}>
+          {!isCreate && (
+            <>
+              <Field label="Secondary adapter" hint="Try this adapter once if the primary execution fails before completing a result.">
+                <div className="flex items-center gap-2">
+                  <AdapterTypeDropdown
+                    value={eff("identity", "secondaryAdapterType", props.agent.secondaryAdapterType ?? "")}
+                    disabledTypes={adapterPickerDisabledTypes}
+                    onChange={(type) => {
+                      mark("identity", "secondaryAdapterType", type);
+                      mark("identity", "secondaryAdapterConfig", {});
+                    }}
+                  />
+                  <Button variant="ghost" size="sm" onClick={() => {
+                    mark("identity", "secondaryAdapterType", null);
+                    mark("identity", "secondaryAdapterConfig", null);
+                  }}>Disable fallback</Button>
+                </div>
+              </Field>
+              {eff("identity", "secondaryAdapterType", props.agent.secondaryAdapterType ?? null) && (
+                <Field label="Secondary model" hint="Leave blank to use the secondary adapter's default model.">
+                  <DraftInput
+                    value={String(asObject(eff("identity", "secondaryAdapterConfig", props.agent.secondaryAdapterConfig ?? {})).model ?? "")}
+                    onCommit={(model) => mark("identity", "secondaryAdapterConfig", {
+                      ...asObject(eff("identity", "secondaryAdapterConfig", props.agent.secondaryAdapterConfig ?? {})),
+                      model: model || undefined,
+                    })}
+                    immediate
+                    className={inputClass}
+                    placeholder="Adapter default"
+                  />
+                </Field>
+              )}
+            </>
+          )}
           {showAdapterTypeField && (
             <Field label="Adapter type" hint={help.adapterType}>
               <AdapterTypeDropdown

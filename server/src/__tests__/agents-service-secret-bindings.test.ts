@@ -75,6 +75,58 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
     return companyId;
   }
 
+  it("keeps primary and secondary bindings separate across updates and disable", async () => {
+    const companyId = await seedCompany();
+    const secrets = secretService(db);
+    const primary = await secrets.create(companyId, { name: "primary", provider: "local_encrypted", value: "primary-fixture" });
+    const secondary = await secrets.create(companyId, { name: "secondary", provider: "local_encrypted", value: "secondary-fixture" });
+    const svc = agentService(db);
+    const created = await svc.create(companyId, {
+      name: "Two providers", role: "engineer", adapterType: "codex_local",
+      adapterConfig: { env: { API_TOKEN: { type: "secret_ref", secretId: primary.id } } },
+      secondaryAdapterType: "claude_local",
+      secondaryAdapterConfig: { model: "secondary-model", env: { API_TOKEN: { type: "secret_ref", secretId: secondary.id } } },
+      runtimeConfig: {}, spentMonthlyCents: 0, lastHeartbeatAt: null,
+    });
+    const readBindings = () => db.select().from(companySecretBindings).where(eq(companySecretBindings.targetId, created.id));
+    expect(await readBindings()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ configPath: "env.API_TOKEN", secretId: primary.id }),
+      expect.objectContaining({ configPath: "secondaryAdapterConfig.env.API_TOKEN", secretId: secondary.id }),
+    ]));
+    const secondaryConfig = created.secondaryAdapterConfig!;
+    const secondaryContext = { consumerType: "agent" as const, consumerId: created.id,
+      configPathPrefix: "secondaryAdapterConfig." as const };
+    expect(await secrets.collectMissingRuntimeBindings(companyId, secondaryConfig.env, secondaryContext)).toEqual([]);
+    const resolved = await secrets.resolveAdapterConfigForRuntime(companyId, secondaryConfig, secondaryContext, { adapterType: "claude_local" });
+    expect(resolved.config.env).toEqual({ API_TOKEN: "secondary-fixture" });
+    expect(resolved.manifest[0].configPath).toBe("secondaryAdapterConfig.env.API_TOKEN");
+    await expect(secrets.resolveAdapterConfigForRuntime(companyId, secondaryConfig, {
+      consumerType: "agent", consumerId: created.id,
+    }, { adapterType: "claude_local" })).rejects.toThrow();
+    await svc.update(created.id, { secondaryAdapterConfig: { model: "updated-model" } }, {
+      recordRevision: { source: "patch" },
+    });
+    expect(await readBindings()).toEqual([expect.objectContaining({ configPath: "env.API_TOKEN", secretId: primary.id })]);
+    const disabled = await svc.update(created.id, { secondaryAdapterType: null });
+    expect(disabled).toMatchObject({ secondaryAdapterType: null, secondaryAdapterConfig: null });
+    expect(await readBindings()).toHaveLength(1);
+  });
+
+  it("rejects secondary secret references from another company without creating an agent", async () => {
+    const companyId = await seedCompany();
+    const foreignCompanyId = await seedCompany();
+    const foreignSecret = await secretService(db).create(foreignCompanyId, {
+      name: "foreign-secondary", provider: "local_encrypted", value: "foreign-fixture",
+    });
+    await expect(agentService(db).create(companyId, {
+      name: "Rejected secondary", role: "engineer", adapterType: "codex_local", adapterConfig: {},
+      secondaryAdapterType: "claude_local",
+      secondaryAdapterConfig: { env: { API_TOKEN: { type: "secret_ref", secretId: foreignSecret.id } } },
+      runtimeConfig: {}, spentMonthlyCents: 0, lastHeartbeatAt: null,
+    })).rejects.toThrow();
+    expect(await db.select().from(agents).where(eq(agents.companyId, companyId))).toHaveLength(0);
+  });
+
   it("creates agent secret bindings when a new agent persists secret_ref env", async () => {
     const companyId = await seedCompany();
     const secrets = secretService(db);

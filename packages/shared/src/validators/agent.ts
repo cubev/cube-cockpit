@@ -95,6 +95,8 @@ export const createAgentSchema = z.object({
   desiredSkills: z.array(agentDesiredSkillSelectionSchema).optional(),
   adapterType: agentAdapterTypeSchema,
   adapterConfig: adapterConfigSchema.optional().default({}),
+  secondaryAdapterType: agentAdapterTypeSchema.nullable().optional(),
+  secondaryAdapterConfig: adapterConfigSchema.nullable().optional(),
   instructionsBundle: createAgentInstructionsBundleSchema.optional(),
   runtimeConfig: agentRuntimeConfigSchema.optional().default({}),
   defaultEnvironmentId: z.string().guid().optional().nullable(),
@@ -277,6 +279,8 @@ export const testAdapterEnvironmentSchema = z.object({
     MINIMAX_API_KEY: z.string().max(16384),
   }).partial().strict().optional(),
   adapterConfig: adapterConfigSchema.optional().default({}),
+  secondaryAdapterType: agentAdapterTypeSchema.nullable().optional(),
+  secondaryAdapterConfig: adapterConfigSchema.nullable().optional(),
   /**
    * Optional environment to run the adapter test inside. When omitted, the
    * test runs against the local Paperclip host. When provided and the

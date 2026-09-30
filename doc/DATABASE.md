@@ -255,9 +255,14 @@ Triage writes serialize on the company and attention-source identity so concurre
 
 Secondary adapter configuration uses nullable `agents.secondary_adapter_type`
 and `secondary_adapter_config` columns. Historical agents remain unconfigured.
-These storage columns alone do not enable fallback or add an API configuration
-surface; configuration writes must use the normal secret normalization and
-redaction paths before runtime rollout.
+The agent create/hire/update API accepts these fields and normalizes secondary
+configuration through the same secret and provider-profile rules as primary
+configuration. Clearing the secondary adapter also clears its configuration.
+Secondary secret bindings and user-secret declarations use the
+`secondaryAdapterConfig.` path prefix, keeping identical primary and secondary
+environment keys separate. API responses redact both configurations and
+restricted views omit both. These configuration surfaces alone do not enable
+runtime fallback.
 
 `heartbeat_runs.fallback_of_run_id` records server-owned attempt lineage,
 separately from generic retries and wake context. A partial unique index admits

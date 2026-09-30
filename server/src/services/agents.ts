@@ -74,6 +74,8 @@ const CONFIG_REVISION_FIELDS = [
   "capabilities",
   "adapterType",
   "adapterConfig",
+  "secondaryAdapterType",
+  "secondaryAdapterConfig",
   "runtimeConfig",
   "defaultEnvironmentId",
   "budgetMonthlyCents",
@@ -174,6 +176,8 @@ function buildConfigSnapshot(
     capabilities: row.capabilities,
     adapterType: row.adapterType,
     adapterConfig,
+    secondaryAdapterType: row.secondaryAdapterType,
+    secondaryAdapterConfig: isPlainRecord(row.secondaryAdapterConfig) ? sanitizeRecord(row.secondaryAdapterConfig) : null,
     runtimeConfig,
     defaultEnvironmentId: row.defaultEnvironmentId,
     budgetMonthlyCents: row.budgetMonthlyCents,
@@ -220,6 +224,8 @@ function configPatchFromApprovalPayload(payload: Record<string, unknown>) {
   }
   if (typeof payload.adapterType === "string") patch.adapterType = payload.adapterType;
   if (isPlainRecord(payload.adapterConfig)) patch.adapterConfig = payload.adapterConfig;
+  if (typeof payload.secondaryAdapterType === "string" || payload.secondaryAdapterType === null) patch.secondaryAdapterType = payload.secondaryAdapterType;
+  if (isPlainRecord(payload.secondaryAdapterConfig) || payload.secondaryAdapterConfig === null) patch.secondaryAdapterConfig = payload.secondaryAdapterConfig;
   if (isPlainRecord(payload.runtimeConfig)) patch.runtimeConfig = payload.runtimeConfig;
   if (Object.prototype.hasOwnProperty.call(payload, "defaultEnvironmentId")) {
     patch.defaultEnvironmentId =
@@ -297,6 +303,8 @@ function configPatchFromSnapshot(snapshot: unknown): Partial<typeof agents.$infe
         : null,
     adapterType: snapshot.adapterType,
     adapterConfig: isPlainRecord(snapshot.adapterConfig) ? snapshot.adapterConfig : {},
+    secondaryAdapterType: typeof snapshot.secondaryAdapterType === "string" ? snapshot.secondaryAdapterType : null,
+    secondaryAdapterConfig: isPlainRecord(snapshot.secondaryAdapterConfig) ? snapshot.secondaryAdapterConfig : null,
     runtimeConfig: runtimeConfig.data,
     defaultEnvironmentId:
       typeof snapshot.defaultEnvironmentId === "string" || snapshot.defaultEnvironmentId === null
@@ -497,11 +505,40 @@ export function agentService(db: Db) {
     }
   }
 
+  async function normalizeSecondaryAdapterPatch(
+    patch: Partial<typeof agents.$inferInsert>,
+    companyId: string,
+    existing?: typeof agents.$inferSelect,
+    dbClient: Db = db,
+  ) {
+    const touchesType = Object.prototype.hasOwnProperty.call(patch, "secondaryAdapterType");
+    const touchesConfig = Object.prototype.hasOwnProperty.call(patch, "secondaryAdapterConfig");
+    if (!touchesType && !touchesConfig) return;
+    const adapterType = touchesType ? patch.secondaryAdapterType : existing?.secondaryAdapterType;
+    if (!adapterType) {
+      if (patch.secondaryAdapterConfig != null) throw unprocessable("secondaryAdapterConfig requires secondaryAdapterType");
+      patch.secondaryAdapterType = null;
+      patch.secondaryAdapterConfig = null;
+      return;
+    }
+    const config = touchesConfig ? patch.secondaryAdapterConfig :
+      adapterType === existing?.secondaryAdapterType ? existing.secondaryAdapterConfig : {};
+    const normalized = await secretService(dbClient).normalizeAdapterConfigForPersistence(
+      companyId, isPlainRecord(config) ? config : {}, { adapterType },
+    );
+    patch.secondaryAdapterConfig = normalizePaperclipRunnerAdapterConfig(adapterType, normalized);
+    assertClaudeOAuthBindingInvariant({
+      adapterType, nextConfig: patch.secondaryAdapterConfig,
+      priorConfig: adapterType === existing?.secondaryAdapterType ? existing.secondaryAdapterConfig : null,
+    });
+  }
+
   async function syncAgentSecretBindings(
-    agent: { id: string; companyId: string; adapterConfig: unknown },
+    agent: { id: string; companyId: string; adapterConfig: unknown; secondaryAdapterConfig?: unknown },
     dbClient: Db = db,
     previousAdapterConfig: unknown = null,
     actor: RevisionMetadata = {},
+    previousSecondaryAdapterConfig: unknown = null,
   ) {
     const scopedSecretsSvc = dbClient === db ? secretsSvc : secretService(dbClient);
     await syncAgentAdapterEnvBindings({
@@ -509,10 +546,13 @@ export function agentService(db: Db) {
       companyId: agent.companyId,
       agentId: agent.id,
       adapterConfig: agent.adapterConfig,
+      secondaryAdapterConfig: agent.secondaryAdapterConfig,
     });
     const previousRefs = new Set([
       ...collectSecretRefs(previousAdapterConfig).map((ref) => `secret:${ref.secretId}:${ref.configPath}`),
       ...collectUserSecretRefs(previousAdapterConfig).map((ref) => `user:${ref.definitionKey}:${ref.configPath}`),
+      ...collectSecretRefs(previousSecondaryAdapterConfig).map((ref) => `secret:${ref.secretId}:secondaryAdapterConfig.${ref.configPath}`),
+      ...collectUserSecretRefs(previousSecondaryAdapterConfig).map((ref) => `user:${ref.definitionKey}:secondaryAdapterConfig.${ref.configPath}`),
     ]);
     const createdRefs = [
       ...collectSecretRefs(agent.adapterConfig).map((ref) => ({
@@ -528,6 +568,16 @@ export function agentService(db: Db) {
         bindingType: "user_secret_ref",
         secretId: null,
         definitionKey: ref.definitionKey,
+      })),
+      ...collectSecretRefs(agent.secondaryAdapterConfig).map((ref) => ({
+        key: `secret:${ref.secretId}:secondaryAdapterConfig.${ref.configPath}`,
+        configPath: `secondaryAdapterConfig.${ref.configPath}`,
+        bindingType: "secret_ref", secretId: ref.secretId, definitionKey: null,
+      })),
+      ...collectUserSecretRefs(agent.secondaryAdapterConfig).map((ref) => ({
+        key: `user:${ref.definitionKey}:secondaryAdapterConfig.${ref.configPath}`,
+        configPath: `secondaryAdapterConfig.${ref.configPath}`,
+        bindingType: "user_secret_ref", secretId: null, definitionKey: ref.definitionKey,
       })),
     ].filter((ref) => !previousRefs.has(ref.key));
     const actorType = actor.createdByUserId ? "user" as const : actor.createdByAgentId ? "agent" as const : "system" as const;
@@ -746,6 +796,7 @@ export function agentService(db: Db) {
     }
 
     const normalizedPatch = { ...data } as Partial<typeof agents.$inferInsert>;
+    await normalizeSecondaryAdapterPatch(normalizedPatch, existing.companyId, existing);
     if (data.permissions !== undefined) {
       normalizedPatch.permissions = normalizeAgentPermissions(data.permissions);
     }
@@ -808,7 +859,7 @@ export function agentService(db: Db) {
           .where(and(eq(agentRuntimeState.companyId, existing.companyId), eq(agentRuntimeState.agentId, id)));
       }
 
-      if (Object.prototype.hasOwnProperty.call(normalizedPatch, "adapterConfig")) {
+      if (["adapterConfig", "secondaryAdapterConfig", "secondaryAdapterType"].some((key) => Object.prototype.hasOwnProperty.call(normalizedPatch, key))) {
         if (bindingDecision) {
           await enforceClaudeOAuthBindingClaim(txDb, {
             companyId: existing.companyId,
@@ -823,6 +874,7 @@ export function agentService(db: Db) {
           txDb,
           existing.adapterConfig,
           options?.recordRevision,
+          existing.secondaryAdapterConfig,
         );
       }
 
@@ -895,6 +947,8 @@ export function agentService(db: Db) {
         ? await secretsSvc.normalizeAdapterConfigForPersistence(companyId, data.adapterConfig, { adapterType })
         : {};
       const adapterConfig = normalizePaperclipRunnerAdapterConfig(adapterType, rawAdapterConfig);
+      const secondaryPatch = { secondaryAdapterType: data.secondaryAdapterType, secondaryAdapterConfig: data.secondaryAdapterConfig };
+      await normalizeSecondaryAdapterPatch(secondaryPatch, companyId);
       // Run the server-enforced binding invariant after generic normalization
       // and before any database write. A create has no prior config.
       const bindingDecision = assertClaudeOAuthBindingInvariant({
@@ -925,6 +979,7 @@ export function agentService(db: Db) {
             role,
             adapterType,
             adapterConfig,
+            ...secondaryPatch,
             permissions: normalizedPermissions,
             runtimeConfig,
           })
@@ -1099,6 +1154,7 @@ export function agentService(db: Db) {
         if (!existing || existing.status !== "pending_approval") return null;
         const approvedPatch = approvedPayload ? configPatchFromApprovalPayload(approvedPayload) : {};
         let patch = { ...approvedPatch } as Partial<typeof agents.$inferInsert>;
+        await normalizeSecondaryAdapterPatch(patch, existing.companyId, existing, txDb);
         let approvalBindingDecision: ClaudeOAuthBindingInvariantDecision | null = null;
         if (
           Object.prototype.hasOwnProperty.call(patch, "adapterConfig") &&
@@ -1149,7 +1205,7 @@ export function agentService(db: Db) {
             environmentId: null,
           });
         }
-        await syncAgentSecretBindings(updated, txDb, existing.adapterConfig);
+        await syncAgentSecretBindings(updated, txDb, existing.adapterConfig, {}, existing.secondaryAdapterConfig);
         const agent = await agentService(txDb).getById(updated.id);
         if (!agent) {
           throw notFound("Agent not found");

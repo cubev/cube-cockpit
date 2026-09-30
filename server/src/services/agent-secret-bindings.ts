@@ -150,18 +150,25 @@ export async function syncAgentAdapterEnvBindings(input: {
   companyId: string;
   agentId: string;
   adapterConfig: unknown;
+  secondaryAdapterConfig?: unknown;
 }) {
   if (input.secretsSvc.syncSecretRefsForTarget) {
     await input.secretsSvc.syncSecretRefsForTarget(
       input.companyId,
       { targetType: "agent", targetId: input.agentId },
-      collectSecretRefs(input.adapterConfig),
+      [
+        ...collectSecretRefs(input.adapterConfig),
+        ...collectSecretRefs(input.secondaryAdapterConfig).map((ref) => ({ ...ref, configPath: `secondaryAdapterConfig.${ref.configPath}` })),
+      ],
       { replaceAll: true },
     );
     await input.secretsSvc.syncUserSecretDeclarationsForTarget?.(
       input.companyId,
       { targetType: "agent", targetId: input.agentId },
-      collectUserSecretRefs(input.adapterConfig),
+      [
+        ...collectUserSecretRefs(input.adapterConfig),
+        ...collectUserSecretRefs(input.secondaryAdapterConfig).map((ref) => ({ ...ref, configPath: `secondaryAdapterConfig.${ref.configPath}` })),
+      ],
       { replaceAll: true },
     );
     return;
