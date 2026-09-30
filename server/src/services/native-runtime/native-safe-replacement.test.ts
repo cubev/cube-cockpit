@@ -165,7 +165,7 @@ const support = externalDatabaseUrl
       expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, source.agentId))).toHaveLength(2);
     });
 
-    it.each(["native_provider_usage_limit", "provider_transport_failed", "bootstrap", "bootstrap_connected", "bootstrap_changed", "bootstrap_login", "bootstrap_unconfigured", "bootstrap_login_cleared"])(
+    it.each(["native_provider_usage_limit", "provider_transport_failed", "bootstrap", "bootstrap_connected", "bootstrap_changed", "bootstrap_login", "bootstrap_unconfigured", "bootstrap_login_cleared", "bootstrap_event_added"])(
       "dispatches a secondary using real stopped-session evidence after %s", async (failureCode) => {
         const source = await seed();
         await db.update(companies).set({ defaultResponsibleUserId: "fixture-owner" }).where(eq(companies.id, source.companyId));
@@ -276,9 +276,14 @@ const support = externalDatabaseUrl
             if (failureCode === "bootstrap_login_cleared") await db.update(agents).set({
               secondaryAdapterType: null, secondaryAdapterConfig: null,
             }).where(eq(agents.id, source.agentId));
+            if (failureCode === "bootstrap_event_added") await appendHeartbeatRunEvent(db, {
+              companyId: source.companyId, runId: source.runId, agentId: source.agentId, eventType: "session.started", stream: "system",
+              payload: { prpEvent: provider }, nativeSource: { sourceInstanceId: runnerInstanceId,
+                sourceEventId: `${runnerInstanceId}:${source.runId}:1`, sourceSeq: 1, protocolSchemaVersion: 1, canonicalPayload: provider },
+            });
             return evidence;
           } };
-          if (failureCode === "bootstrap_login_cleared") {
+          if (["bootstrap_login_cleared", "bootstrap_event_added"].includes(failureCode)) {
             expect(await reconcileSafeNativeReplacements(db, new Date(), options)).toMatchObject({ scheduled: 0 });
             expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, source.agentId))).toHaveLength(1);
             return;

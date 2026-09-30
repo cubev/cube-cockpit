@@ -16,6 +16,7 @@ import {
   toolInvocations,
   type Db,
 } from "@paperclipai/db";
+import { nativeSha256 } from "./canonical.js";
 import { decideNativeReplacement } from "./native-replacement-evidence.js";
 import { issueService } from "../issues.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
@@ -376,6 +377,14 @@ export async function reconcileSafeNativeReplacements(
           )).for("update");
           if (!currentRun || currentRun.status !== "failed" || currentRun.runnerInstanceId !== run.runnerInstanceId ||
               currentRun.nativeSessionId !== run.nativeSessionId || currentRun.processPid || currentRun.processGroupId) return false;
+          if (stoppedSession.evidence.schema === "paperclip.stopped_native_bootstrap.v1") {
+            if (nativeSha256(currentRun.runnerProfileJson) !== nativeSha256(run.runnerProfileJson)) return false;
+            const [lateEvent] = await tx.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents).where(and(
+              eq(heartbeatRunEvents.companyId, run.companyId), eq(heartbeatRunEvents.runId, run.id),
+              sql`${heartbeatRunEvents.sourceEventId} is not null`,
+            )).limit(1);
+            if (lateEvent) return false;
+          }
         }
         // An automatic retry already consumed the primary failure's budget.
         // It cannot manufacture a new primary -> secondary pair.
