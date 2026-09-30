@@ -109,7 +109,7 @@ export async function reconcileSafeNativeReplacements(
       if (leases.some((lease) => lease.releasedAt === null)) continue;
       if (configuredAgent?.secondaryAdapterType && leases.some(lease =>
           lease.provider !== "local" && !hasRemoteTerminationReceipt(lease))) continue;
-      const stoppedSession = coordinator.failureCode !== "native_provider_terminal_failed"
+      const stoppedSession = (coordinator.failureCode !== "native_provider_terminal_failed" || configuredAgent?.secondaryAdapterType)
         ? await options.verifyStoppedSession?.(run) ?? null : null;
       // A transport label alone is not evidence. Keep inspecting these candidates
       // as process cleanup and the final transcript become durable.
@@ -341,7 +341,7 @@ export async function reconcileSafeNativeReplacements(
           eq(agents.id, run.agentId), eq(agents.companyId, run.companyId),
         ));
         const useSecondary = Boolean(executionAgent?.secondaryAdapterType);
-        if (secondaryOnlyCandidate && !useSecondary) return false;
+        if ((secondaryOnlyCandidate || stoppedSession?.evidence.schema === "paperclip.stopped_native_bootstrap.v1") && !useSecondary) return false;
         if (
           !task ||
           task.assigneeAgentId !== run.agentId ||
@@ -397,8 +397,9 @@ export async function reconcileSafeNativeReplacements(
           if (!stoppedSession.retire()) throw new Error("native_replacement_stopped_session_changed");
           await appendHeartbeatRunEvent(tx as unknown as Db, {
             companyId: run.companyId, runId: run.id, agentId: run.agentId,
-            eventType: "native.stopped_text_turn_verified", stream: "system", level: "info",
-            message: "The previous runner and provider stopped. The interrupted turn had no external actions; any completion bookkeeping has a verified receipt.",
+            eventType: stoppedSession.evidence.schema === "paperclip.stopped_native_bootstrap.v1"
+              ? "native.stopped_bootstrap_verified" : "native.stopped_text_turn_verified", stream: "system", level: "info",
+            message: "The previous runner stopped and the verified execution inventory permits a fresh attempt.",
             payload: stoppedSession.evidence,
           });
         }
@@ -406,6 +407,8 @@ export async function reconcileSafeNativeReplacements(
           companyId: run.companyId, agentId: run.agentId, primaryRunId: run.id,
           providerStopped: true, completed: false, failureReason:
             current.failureCode === "native_provider_usage_limit" ? "quota" :
+              ["authentication_failed", "login_required", "codex_auth_required", "acpx_auth_required", "claude_auth_required"].includes(String(current.failureDetail?.originalFailureCode))
+                ? "authentication" :
               ["provider_initialize_timeout", "provider_request_timeout"].includes(String(current.failureDetail?.originalFailureCode))
                 ? "timeout" : "provider",
         }) : null;

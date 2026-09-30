@@ -106,12 +106,14 @@ import {
   gt,
   inArray,
   isNull,
+  isNotNull,
   like,
   notInArray,
   or,
   sql,
 } from "drizzle-orm";
 import {
+  agents,
   agentWakeupRequests,
   documentRevisions,
   environmentLeases,
@@ -2635,10 +2637,52 @@ export async function verifyStoppedNativeSessionForReplacement(
     if (!idle()) return null;
     const leases = await db.select().from(environmentLeases).where(and(
       eq(environmentLeases.companyId, run.companyId), eq(environmentLeases.heartbeatRunId, run.id)));
-    if (leases.some(lease => lease.provider !== "local" || !lease.releasedAt)) return null;
+    if (leases.some(lease => lease.provider !== "local" || !lease.releasedAt || lease.cleanupStatus === "failed")) return null;
     const stopped = await readNativeLocalProcessStop(db, run.companyId, run.id);
     if (!stopped) return null;
     const root = scopedRunnerdStateRoot(execution);
+    // A runner that never authenticated cannot have opened a provider. Require
+    // the exact untouched controller root, no harness directory, no checkpoint,
+    // and no durable PRP event; a missing provider identity alone proves nothing.
+    const untouchedBootstrap = () => {
+      if (!isSafeNativeStateDirectory(root) || !isSafeNativeStateDirectory(resolve(root, "control-plane")) ||
+          lstatSync(resolve(root, "runner"), { throwIfNoEntry: false }) ||
+          lstatSync(resolve(root, "codex-home"), { throwIfNoEntry: false }) ||
+          Object.keys(record(record(run.runnerProfileJson).sessionCheckpoint)).length ||
+          !runnerdStateProvesIncompleteBootstrap(root)) return null;
+      const bytes = readBoundedNativeFile(resolve(root, "control-plane", "control-plane-state.json"),
+        NATIVE_CONTROL_PLANE_STATE_MAX_BYTES, "native_bootstrap_inventory_unproven");
+      const state = record(JSON.parse(bytes.toString("utf8")));
+      if (!Array.isArray(state.commands) || !Array.isArray(state.committedEvents)) return null;
+      const identity = state.identity;
+      if (!durableIdentityMatchesExecution(record(identity), execution) ||
+          record(identity).runnerInstanceId !== run.runnerInstanceId) return null;
+      return nativeSha256(bytes.toString("utf8"));
+    };
+    const bootstrapFingerprint = untouchedBootstrap();
+    if (bootstrapFingerprint) {
+      // This additional proof is exclusively for configured secondary attempts;
+      // do not expand the existing generic primary-replacement behavior.
+      const [agent] = await db.select({ secondaryAdapterType: agents.secondaryAdapterType }).from(agents).where(and(
+        eq(agents.companyId, run.companyId), eq(agents.id, run.agentId),
+      )).limit(1);
+      if (!agent?.secondaryAdapterType) return null;
+      const durableEvents = await db.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents).where(and(
+        eq(heartbeatRunEvents.companyId, run.companyId), eq(heartbeatRunEvents.runId, run.id),
+        isNotNull(heartbeatRunEvents.sourceEventId),
+      )).limit(1);
+      if (durableEvents.length) return null;
+      return {
+        evidence: { schema: "paperclip.stopped_native_bootstrap.v1", runId: run.id,
+          nativeSessionId: run.nativeSessionId, runnerInstanceId: run.runnerInstanceId,
+          processPid: stopped.processPid, stateFingerprint: bootstrapFingerprint, completedTaskControlCallIds: [] },
+        retire: () => {
+          try { return idle() && cleanupProcessAbsent(stopped.processPid) && untouchedBootstrap() === bootstrapFingerprint &&
+            completeTerminatedLocalNativeSessionCleanup({ companyId: run.companyId, runId: run.id, runnerInstanceId: run.runnerInstanceId! });
+          } catch { return false; }
+        },
+      };
+    }
     const snapshot = cleanupStateSnapshot(root);
     const identity = record(snapshot.control.identity);
     if (!durableIdentityMatchesExecution(identity, execution) || identity.runnerInstanceId !== run.runnerInstanceId ||

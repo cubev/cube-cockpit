@@ -15,9 +15,14 @@ import {
   deliverReconciledExecutions,
 } from "../execution-recovery-resolution.js";
 import { randomUUID } from "node:crypto";
+import { nativeSha256 } from "./canonical.js";
+import { verifyStoppedNativeSessionForReplacement } from "./native-session-executor.js";
+import { nativeToolContractFingerprintForTarget } from "./native-session-resume.js";
+import { registerServerAdapter, unregisterServerAdapter, type ServerAdapterModule } from "../../adapters/index.js";
+import { drainHeartbeatRunsToQuiescence } from "../../__tests__/helpers/drain-heartbeat-runs.js";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import { tmpdir } from "node:os";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
@@ -159,6 +164,141 @@ const support = externalDatabaseUrl
       await reconcileSafeNativeReplacements(db);
       expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, source.agentId))).toHaveLength(2);
     });
+
+    it.each(["native_provider_usage_limit", "provider_transport_failed", "bootstrap", "bootstrap_connected", "bootstrap_changed", "bootstrap_login", "bootstrap_unconfigured", "bootstrap_login_cleared"])(
+      "dispatches a secondary using real stopped-session evidence after %s", async (failureCode) => {
+        const source = await seed();
+        await db.update(companies).set({ defaultResponsibleUserId: "fixture-owner" }).where(eq(companies.id, source.companyId));
+        const base = await mkdtemp(join(tmpdir(), "secondary-native-proof-"));
+        const previous = process.env.PAPERCLIP_RUNNER_STATE_DIR;
+        process.env.PAPERCLIP_RUNNER_STATE_DIR = base;
+        const normalizedSessionId = randomUUID();
+        const runnerInstanceId = randomUUID();
+        const execution = {
+          schema: "paperclip.native-execution-input.v1",
+          provider: { kind: "codex", model: null },
+          binding: { ...source, runId: source.runId, executionWorkspaceId: source.runId },
+          task: { identifier: "FIXTURE", title: "Read fixture", description: null, prompt: "Read fixture.", workMode: "standard" },
+          workspace: { cwd: base, repoUrl: null, repoRef: null, branchName: null },
+          session: { normalizedSessionId, driverKind: "codex_app_server", protocolVersion: 1,
+            lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null } },
+          completionContract: { id: "contract", sha256: "sha", schemaVersion: "paperclip.completion-contract.v1",
+            contract: { revision: "1", objective: "Read fixture.", criteria: [{ id: "objective", requirement: "Read fixture." }] } },
+          interactionResponses: [], credentialBindings: [],
+        };
+        const root = join(base, nativeSha256({ schema: "paperclip.native-session-scope.v2", companyId: source.companyId,
+          agentId: source.agentId, workspace: { kind: "transient", cwd: base, repoUrl: null, repoRef: null, branchName: null },
+          provider: { driverKind: "codex_app_server", identity: { kind: "codex" } }, normalizedSessionId }));
+        const identity = { runnerInstanceId, environmentLeaseId: source.runId, runId: source.runId,
+          normalizedSessionId, turnId: "turn", itemId: "item" };
+        const event = (sourceSeq: number, eventType: string, payload: unknown) => ({
+          schema: "paperclip.prp.event.v1", schemaVersion: 1, sourceKind: "runner", sourceSeq,
+          sourceEventId: `fixture-${sourceSeq}`, sourceInstanceId: runnerInstanceId, runId: source.runId,
+          normalizedSessionId, turnId: "turn", itemId: "item", priority: 0, emittedAt: new Date().toISOString(), eventType, payload,
+        });
+        const provider = event(1, "session.started", { providerSessionId: "thread", processId: 99_999_998 });
+        const accepted = event(2, "turn.accepted", { providerSessionId: "thread", providerTurnId: "provider-turn" });
+        const execute = vi.fn<ServerAdapterModule["execute"]>().mockImplementation(async ctx => {
+          expect(ctx.config.model).toBe("secondary");
+          expect(ctx.runtime.sessionId).toBeNull();
+          expect(ctx.context).not.toHaveProperty("resumeSessionParams");
+          await ctx.onProviderStopped?.();
+          return { exitCode: 0, signal: null, timedOut: false, model: "actual-secondary", summary: "Finished." };
+        });
+        const heartbeat = heartbeatService(db);
+        registerServerAdapter({ type: "claude_local", supportsLocalAgentJwt: false, execute,
+          testEnvironment: async () => ({ adapterType: "claude_local", status: "pass", checks: [], testedAt: new Date().toISOString() }) });
+        try {
+          await mkdir(join(root, "control-plane"), { recursive: true });
+          await mkdir(join(root, "runner"), { recursive: true });
+          await mkdir(join(root, "codex-home/sessions"), { recursive: true });
+          await writeFile(join(root, "control-plane/control-plane-state.json"), JSON.stringify({
+            schema: "paperclip.runner.durable.control-plane-state.v1", identity,
+            committedEvents: [provider, accepted].map(payload => ({ envelope: { payload } })),
+            commands: [{ type: "turn.start", status: "completed", result: { result: { providerTurnId: "provider-turn" } } }],
+          }));
+          await writeFile(join(root, "runner/runner-state.json"), JSON.stringify({
+            schema: "paperclip.runner.durable.state.v1", ...identity, lifecycle: "ready", outbox: [],
+          }));
+          await writeFile(join(root, "runner/codex-provider-state.json"), JSON.stringify({
+            schema: "paperclip.runner.codex-provider-state.v1", lifecycle: "turn_active", config: { provider: "codex", cwd: base },
+            threadId: "thread", activeProviderTurnId: "provider-turn", pendingEvents: [], queuedEvents: [],
+          }));
+          const rows = [
+            { type: "session_meta", payload: { id: "thread", cwd: base } },
+            { type: "event_msg", payload: { type: "task_started", turn_id: "provider-turn" } },
+            { type: "turn_context", payload: { turn_id: "provider-turn", cwd: base } },
+            { type: "response_item", payload: { type: "message", role: "assistant" } },
+            { type: "event_msg", payload: { type: "turn_aborted", turn_id: "provider-turn", reason: "interrupted" } },
+          ];
+          await writeFile(join(root, "codex-home/sessions/rollout-thread.jsonl"), rows.map(row => JSON.stringify(row)).join("\n") + "\n");
+          await db.update(agents).set({ secondaryAdapterType: "claude_local", secondaryAdapterConfig: { model: "secondary" } }).where(eq(agents.id, source.agentId));
+          await db.update(heartbeatRuns).set({ nativeSessionId: normalizedSessionId, runnerInstanceId, finishedAt: new Date(),
+            runnerProfileJson: { nativeExecutionInput: execution, nativeToolContractFingerprint: nativeToolContractFingerprintForTarget("local") },
+          }).where(eq(heartbeatRuns.id, source.runId));
+          await db.update(nativeRunFinalizations).set({ failureCode: failureCode.startsWith("bootstrap_login") ? "native_provider_terminal_failed" : failureCode.startsWith("bootstrap") ? "native_session_retry_exhausted" : failureCode,
+            failureDetail: { originalFailureCode: failureCode.startsWith("bootstrap_login") ? "authentication_failed" : failureCode.startsWith("bootstrap") ? "provider_initialize_timeout" : failureCode } }).where(eq(nativeRunFinalizations.runId, source.runId));
+          if (failureCode.startsWith("bootstrap")) {
+            await rm(join(root, "runner"), { recursive: true });
+            await rm(join(root, "codex-home"), { recursive: true });
+            await writeFile(join(root, "control-plane/control-plane-state.json"), JSON.stringify({
+              schema: "paperclip.runner.durable.control-plane-state.v1", identity,
+              connectionCount: failureCode === "bootstrap_connected" ? 1 : 0, committedEvents: [],
+              commands: [{ type: "run.prepare", status: "pending" }, { type: "session.open", status: "pending" }],
+            }));
+          } else await appendHeartbeatRunEvent(db, { companyId: source.companyId, runId: source.runId, agentId: source.agentId,
+            eventType: "session.started", stream: "system", payload: { prpEvent: provider },
+            nativeSource: { sourceInstanceId: runnerInstanceId, sourceEventId: `${runnerInstanceId}:${source.runId}:1`,
+              sourceSeq: 1, protocolSchemaVersion: 1, canonicalPayload: provider } });
+          await appendHeartbeatRunEvent(db, { companyId: source.companyId, runId: source.runId, agentId: source.agentId,
+            eventType: "native.local_process_stopped", stream: "system", payload: { processPid: 99_999_999, processGroupId: 99_999_999 } });
+          const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, source.runId));
+          if (failureCode === "bootstrap_unconfigured") await db.update(agents).set({
+            secondaryAdapterType: null, secondaryAdapterConfig: null,
+          }).where(eq(agents.id, source.agentId));
+          const proof = await verifyStoppedNativeSessionForReplacement(db, run!);
+          if (["bootstrap_connected", "bootstrap_unconfigured"].includes(failureCode)) {
+            expect(proof).toBeNull();
+            expect(await reconcileSafeNativeReplacements(db, new Date(), {
+              verifyStoppedSession: run => verifyStoppedNativeSessionForReplacement(db, run),
+            })).toMatchObject({ scheduled: 0 });
+            expect(execute).not.toHaveBeenCalled();
+            return;
+          }
+          expect(proof).not.toBeNull();
+          if (failureCode === "bootstrap_changed") {
+            await writeFile(join(root, "control-plane/control-plane-state.json"), "{}");
+            expect(proof!.retire()).toBe(false);
+            return;
+          }
+          const options = { verifyStoppedSession: async (run: typeof heartbeatRuns.$inferSelect) => {
+            const evidence = await verifyStoppedNativeSessionForReplacement(db, run);
+            if (failureCode === "bootstrap_login_cleared") await db.update(agents).set({
+              secondaryAdapterType: null, secondaryAdapterConfig: null,
+            }).where(eq(agents.id, source.agentId));
+            return evidence;
+          } };
+          if (failureCode === "bootstrap_login_cleared") {
+            expect(await reconcileSafeNativeReplacements(db, new Date(), options)).toMatchObject({ scheduled: 0 });
+            expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, source.agentId))).toHaveLength(1);
+            return;
+          }
+          expect(await reconcileSafeNativeReplacements(db, new Date(), options)).toMatchObject({ scheduled: 1 });
+          expect(await reconcileSafeNativeReplacements(db, new Date(), options)).toMatchObject({ scheduled: 0 });
+          const [secondary] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.fallbackOfRunId, source.runId));
+          await heartbeat.retryScheduledRetryNow({ issueId: source.issueId });
+          await heartbeat.resumeQueuedRuns();
+          await drainHeartbeatRunsToQuiescence(db, heartbeat);
+          expect(await heartbeat.getRun(secondary!.id)).toMatchObject({ status: "succeeded", executionAdapterType: "claude_local", executionModel: "actual-secondary",
+            fallbackReason: failureCode === "bootstrap_login" ? "authentication" : failureCode === "bootstrap" ? "timeout" : failureCode === "native_provider_usage_limit" ? "quota" : "provider" });
+          expect(execute).toHaveBeenCalledOnce();
+        } finally {
+          await drainHeartbeatRunsToQuiescence(db, heartbeat);
+          unregisterServerAdapter("claude_local");
+          if (previous === undefined) delete process.env.PAPERCLIP_RUNNER_STATE_DIR; else process.env.PAPERCLIP_RUNNER_STATE_DIR = previous;
+          await rm(base, { recursive: true, force: true });
+        }
+      });
 
     it.each([
       { code: "native_provider_usage_limit", sourceCode: "usageLimitExceeded", reason: "quota" },

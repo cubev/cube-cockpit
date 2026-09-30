@@ -518,6 +518,10 @@ Configured secondary adapters also make native quota and allowlisted exhausted
 process/timeout failures eligible for safe-replacement inspection. These extra
 candidates require the stopped-session verifier; a failure code alone does not
 authorize replacement. Same-run native resumes do not consume the single
-persisted secondary attempt. Bootstrap failures without an established session
-remain outside this verifier, and unconfigured agents retain their existing
-replacement budget. Budget hard stops still pause the agent before reservation.
+persisted secondary attempt. A local bootstrap that never authenticated can
+also be verified using its exact controller identity, zero connections, untouched
+bootstrap commands, no harness/provider-home directory, no checkpoint or PRP
+events, and a bound process-stop receipt. State changes invalidate that proof.
+Unconfigured agents retain their existing replacement budget. Budget hard stops
+still pause the agent before reservation. Scheduled secondary attempts participate
+in the existing issue retry inspection and immediate-promotion path.
