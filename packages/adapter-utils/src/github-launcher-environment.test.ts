@@ -281,12 +281,15 @@ describe("managed GitHub launcher environment", () => {
 
   it("checks command availability with the launch environment, not the provider default", async () => {
     const fixture = await sandbox("nvm/bin");
-    const env = { PATH: "/usr/bin:/bin" };
+    const launchBin = path.join(fixture.root, "empty-launch-bin");
+    await mkdir(launchBin);
+    const env = { PATH: launchBin };
+    // Use an empty fixture directory so globally installed CLIs cannot satisfy the probe.
     // The binary exists on the provider PATH, but the requested launch excludes it.
     await expect(ensureAdapterExecutionTargetCommandResolvable(
       "claude", fixture.target, fixture.root, env,
     )).rejects.toThrow('Command "claude" is not installed or not on PATH');
-    const result = await runAdapterExecutionTargetProcess("run-missing", fixture.target, "sh", ["-c", "claude"], {
+    const result = await runAdapterExecutionTargetProcess("run-missing", fixture.target, "/bin/sh", ["-c", "claude"], {
       cwd: fixture.root, env, timeoutSec: 5, graceSec: 1, onLog: async () => {},
     });
     expect(result.exitCode).toBe(127);
