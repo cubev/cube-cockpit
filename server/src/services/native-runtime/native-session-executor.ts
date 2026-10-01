@@ -2195,7 +2195,12 @@ export function retainedNativeCleanupJournalMatches(input: {
         payload.isError === false &&
         payload.sourceEventId === event.sourceEventId &&
         payload.sourceEventType === event.eventType &&
-        canonicalJson(payload.input) === canonicalJson(semantic.input) &&
+        // New journals retain the input once in the event and bind the
+        // result command by digest. Historical journals retain the full input.
+        (payload.inputDigest === undefined
+          ? canonicalJson(payload.input) === canonicalJson(semantic.input)
+          : payload.inputDigest === nativeSha256(semantic.input) &&
+            payload.input === undefined) &&
         canonicalJson(payload.correlation) ===
           canonicalJson(semantic.correlation) &&
         record(record(command.result).result).callId === semantic.callId
