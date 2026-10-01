@@ -525,3 +525,16 @@ events, and a bound process-stop receipt. State changes invalidate that proof.
 Unconfigured agents retain their existing replacement budget. Budget hard stops
 still pause the agent before reservation. Scheduled secondary attempts participate
 in the existing issue retry inspection and immediate-promotion path.
+
+Secondary adapter fields on agent hire/create are board-only, matching agent
+PATCH. The secondary creation configuration receives fresh-provider, legacy
+prompt, external-instructions and Codex API-key home-isolation checks. Hire
+approval activation preserves the pending agent's validated secondary settings;
+it cannot introduce secondary settings from an approval payload. An omitted
+secondary adapter type has no default.
+
+Legacy secondary reservation transfers the issue execution lock to its queued
+successor in the same transaction. A competing execution owner or reassignment
+rejects reservation. The primary executor defers issue release until that decision
+and restores ordinary retry, review and continuation disposition when no
+secondary is reserved, including reservation errors and skipped attempts.

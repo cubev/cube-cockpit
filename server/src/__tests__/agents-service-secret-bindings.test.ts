@@ -112,6 +112,20 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
     expect(await readBindings()).toHaveLength(1);
   });
 
+  it("does not replay secondary configuration from a hire approval payload", async () => {
+    const companyId = await seedCompany();
+    const [pending] = await db.insert(agents).values({ companyId, name: "Pending fixture",
+      status: "pending_approval", adapterType: "codex_local", adapterConfig: {},
+      secondaryAdapterType: "claude_local", secondaryAdapterConfig: { model: "validated" },
+    }).returning();
+    const activated = await agentService(db).activatePendingApproval(pending.id, {
+      secondaryAdapterType: "codex_local",
+      secondaryAdapterConfig: { workspaceSetupCommand: "echo forbidden", env: { CODEX_HOME: "/foreign/home" } },
+    });
+    expect(activated?.agent).toMatchObject({ status: "idle", secondaryAdapterType: "claude_local",
+      secondaryAdapterConfig: { model: "validated" } });
+  });
+
   it("rejects secondary secret references from another company without creating an agent", async () => {
     const companyId = await seedCompany();
     const foreignCompanyId = await seedCompany();

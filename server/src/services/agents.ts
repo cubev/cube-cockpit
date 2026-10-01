@@ -224,8 +224,9 @@ function configPatchFromApprovalPayload(payload: Record<string, unknown>) {
   }
   if (typeof payload.adapterType === "string") patch.adapterType = payload.adapterType;
   if (isPlainRecord(payload.adapterConfig)) patch.adapterConfig = payload.adapterConfig;
-  if (typeof payload.secondaryAdapterType === "string" || payload.secondaryAdapterType === null) patch.secondaryAdapterType = payload.secondaryAdapterType;
-  if (isPlainRecord(payload.secondaryAdapterConfig) || payload.secondaryAdapterConfig === null) patch.secondaryAdapterConfig = payload.secondaryAdapterConfig;
+  // Secondary fields are validated by the board-only hire/create routes and
+  // persisted on the pending agent. Approval payloads cannot introduce or
+  // replace them; configure changes through the protected agent PATCH route.
   if (isPlainRecord(payload.runtimeConfig)) patch.runtimeConfig = payload.runtimeConfig;
   if (Object.prototype.hasOwnProperty.call(payload, "defaultEnvironmentId")) {
     patch.defaultEnvironmentId =

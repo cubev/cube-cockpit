@@ -1,6 +1,6 @@
 import { hasAcceptedSemanticResult } from "./heartbeat-run-summary.js";
 import { and, eq, isNull, or } from "drizzle-orm";
-import { agents, agentWakeupRequests, heartbeatRuns, nativeRunFinalizations, nativeRunResults, type Db } from "@paperclipai/db";
+import { agents, agentWakeupRequests, heartbeatRuns, issues, nativeRunFinalizations, nativeRunResults, type Db } from "@paperclipai/db";
 import { legacyExecutionNeedsReconciliation } from "./legacy-execution-recovery.js";
 import { decideSecondaryAdapterFallback, type SecondaryAdapterFailureReason } from "./secondary-adapter-fallback.js";
 
@@ -40,6 +40,14 @@ export async function reserveSecondaryAdapterAttempt(db: Db, input: {
       failureReason: input.failureReason,
     });
     if (!decision.fallback) return null;
+    const issueId = primary.contextSnapshot?.issueId ?? primary.contextSnapshot?.taskId;
+    const [issue] = primary.runtimeMode !== "native" && typeof issueId === "string"
+      ? await tx.select().from(issues).where(and(eq(issues.id, issueId), eq(issues.companyId, input.companyId))).for("update")
+      : [];
+    // A competing claim or reassignment wins; never reserve parallel provider work.
+    if (issue && (issue.assigneeAgentId !== primary.agentId ||
+        (issue.executionRunId && issue.executionRunId !== primary.id))) return null;
+
     // Only copy task routing. Session, continuation, interaction delivery and
     // authorization attestations belong to the primary adapter/run.
     const source = primary.contextSnapshot ?? {};
@@ -63,6 +71,10 @@ export async function reserveSecondaryAdapterAttempt(db: Db, input: {
       executionAdapterType: agent.secondaryAdapterType,
     }).returning();
     await tx.update(agentWakeupRequests).set({ runId: run.id }).where(eq(agentWakeupRequests.id, wake.id));
+    if (issue) await tx.update(issues).set({
+      executionRunId: run.id, executionLockedAt: new Date(), updatedAt: new Date(),
+    }).where(and(eq(issues.id, issue.id), eq(issues.companyId, input.companyId)));
+
     return run;
   });
 }

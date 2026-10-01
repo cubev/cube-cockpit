@@ -1,10 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { and, eq } from "drizzle-orm";
-import { agents, agentRuntimeState, agentWakeupRequests, companies, costEvents, budgetPolicies, createDb, heartbeatRuns } from "@paperclipai/db";
+import { agents, agentRuntimeState, agentWakeupRequests, companies, costEvents, budgetPolicies, createDb, heartbeatRuns, issues } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { reserveSecondaryAdapterAttempt, resolveSecondaryExecutionAgent } from "../services/secondary-adapter-attempts.js";
 
+import * as secondaryAttempts from "../services/secondary-adapter-attempts.js";
 import { budgetService } from "../services/budgets.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { registerServerAdapter, unregisterServerAdapter, type ServerAdapterModule } from "../adapters/index.js";
@@ -68,6 +69,72 @@ const support = await getEmbeddedPostgresTestSupport();
   ])("preserves admission boundaries for %j", async (options) => {
     const { input } = await fixture(options);
     expect(await reserveSecondaryAdapterAttempt(db, input)).toBeNull();
+  });
+
+  it("transfers the issue lock atomically and rejects an intervening owner", async () => {
+    const { agent, run, input } = await fixture();
+    const [issue] = await db.insert(issues).values({ companyId: agent.companyId, title: "Lock fixture",
+      status: "in_progress", assigneeAgentId: agent.id, executionRunId: run.id,
+    }).returning();
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: issue.id } }).where(eq(heartbeatRuns.id, run.id));
+    const successor = (await reserveSecondaryAdapterAttempt(db, input))!;
+    const [locked] = await db.select().from(issues).where(eq(issues.id, issue.id));
+    expect(locked.executionRunId).toBe(successor.id);
+    await db.update(heartbeatRuns).set({ status: "cancelled" }).where(eq(heartbeatRuns.id, successor.id));
+
+    const other = await fixture();
+    const [claimed] = await db.insert(heartbeatRuns).values({ companyId: other.agent.companyId,
+      agentId: other.agent.id, status: "running" }).returning();
+    const [otherIssue] = await db.insert(issues).values({ companyId: other.agent.companyId, title: "Competing owner",
+      assigneeAgentId: other.agent.id, executionRunId: claimed.id,
+    }).returning();
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: otherIssue.id } }).where(eq(heartbeatRuns.id, other.run.id));
+    expect(await reserveSecondaryAdapterAttempt(db, other.input)).toBeNull();
+    await db.update(heartbeatRuns).set({ status: "failed" }).where(eq(heartbeatRuns.id, claimed.id));
+  });
+
+  it.each(["null", "throw"])("restores ordinary issue disposition when reservation returns %s", async (failure) => {
+    const { agent, run } = await fixture({ status: "queued" });
+    const [issue] = await db.insert(issues).values({ companyId: agent.companyId, title: "Disposition fixture",
+      status: "in_progress", assigneeAgentId: agent.id, responsibleUserId: "fixture-owner",
+    }).returning();
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: issue.id } }).where(eq(heartbeatRuns.id, run.id));
+    const [pending] = await db.insert(agentWakeupRequests).values({ companyId: agent.companyId, agentId: agent.id,
+      source: "automation", triggerDetail: "system", reason: "followup", status: "deferred_issue_execution",
+      payload: { issueId: issue.id },
+    }).returning();
+    let executions = 0;
+    const reserve = vi.spyOn(secondaryAttempts, "reserveSecondaryAdapterAttempt");
+    if (failure === "null") reserve.mockResolvedValueOnce(null);
+    else reserve.mockRejectedValueOnce(new Error("Fixture reservation failed"));
+    registerServerAdapter({ type: "codex_local", supportsLocalAgentJwt: false,
+      execute: async ctx => {
+        await ctx.onProviderStopped?.();
+        if (++executions > 1) {
+          await db.update(issues).set({ status: "done" }).where(eq(issues.id, issue.id));
+          return { exitCode: 0, signal: null, timedOut: false, summary: "Follow-up complete" };
+        }
+        return { exitCode: 1, signal: null, timedOut: false, errorMessage: "Fixture failed",
+          executionRecovery: { kind: "bootstrap", providerWorkStarted: false } };
+      }, testEnvironment: async () => ({ adapterType: "codex_local", status: "pass", checks: [], testedAt: new Date(0).toISOString() }),
+    });
+    const heartbeat = heartbeatService(db);
+    try {
+      await heartbeat.resumeQueuedRuns();
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+      expect(reserve).toHaveBeenCalled();
+      const [settled] = await db.select().from(issues).where(eq(issues.id, issue.id));
+      expect(settled.executionRunId).toBeNull();
+      expect(settled.status).toBe("done");
+      expect(executions).toBe(2);
+      const [promoted] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, pending.id));
+      expect(promoted.runId).not.toBeNull();
+      expect((await heartbeat.getRun(promoted.runId!))?.status).toBe("succeeded");
+    } finally {
+      reserve.mockRestore();
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+      unregisterServerAdapter("codex_local");
+    }
   });
 
   it("executes a reserved secondary with resolved model and isolated runtime session", async () => {

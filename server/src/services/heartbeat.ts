@@ -25668,7 +25668,7 @@ export function heartbeatService(
             resolvedPresentationDecision,
           );
           const conversationSettled = await settleConversationTurn(db, livenessRun);
-          await releaseIssueExecutionAndPromote(livenessRun, {
+          if (!secondaryDispositionDeferred) await releaseIssueExecutionAndPromote(livenessRun, {
             suppressImmediateRecovery: secondaryDispositionDeferred || Boolean(run.fallbackOfRunId) || (secondaryConfigured && secondaryCompleted && outcome !== "succeeded") || conversationSettled ||
               readNonEmptyString(
                 parseObject(livenessRun.contextSnapshot).goalControlRequestId,
@@ -26085,14 +26085,14 @@ export function heartbeatService(
           if (!secondaryDispositionDeferred && !run.fallbackOfRunId) {
             await scheduleInteractionContinuationInfrastructureRetryIfEligible(livenessRun, agent);
           }
-          await releaseIssueExecutionAndPromote(livenessRun, {
+          if (!secondaryDispositionDeferred) await releaseIssueExecutionAndPromote(livenessRun, {
             // Native recovery owns the original heartbeat run through
             // exhaustion. Once its durable coordinator has classified a
             // terminal failure, generic issue recovery must not create a
             // replacement retryOfRunId chain for the same provider work.
             suppressImmediateRecovery: secondaryDispositionDeferred || Boolean(run.fallbackOfRunId) || nativeTerminalFailureCode !== null,
           });
-          await handleIssueReviewPathDisposition(livenessRun);
+          if (!secondaryDispositionDeferred) await handleIssueReviewPathDisposition(livenessRun);
 
           await updateRuntimeState(
             agent,
@@ -26590,20 +26590,57 @@ export function heartbeatService(
           adapterExecutionControls.delete(run.id);
         }
       }
-      if (secondaryDispositionDeferred && latestRun && !shutdownInProgress &&
-          !nativeSessionResumeScheduled && !nativeWorkspaceFinalizeScheduled && !nativeOwnershipHeld &&
-          !executionControl.controller.signal.aborted) {
-        const secondary = await reserveSecondaryAdapterAttempt(db, {
-          companyId: run.companyId, agentId: run.agentId, primaryRunId: run.id,
-          providerStopped: secondaryProviderStopped,
-          completed: secondaryCompleted || hasAcceptedSemanticResult(latestRun.resultJson),
-          failureReason: secondaryFailureReason,
-        });
+      if (secondaryDispositionDeferred && latestRun) {
+        let secondary: Awaited<ReturnType<typeof reserveSecondaryAdapterAttempt>> = null;
+        if (!shutdownInProgress && !nativeSessionResumeScheduled && !nativeWorkspaceFinalizeScheduled &&
+            !nativeOwnershipHeld && !executionControl.controller.signal.aborted) {
+          try {
+            secondary = await reserveSecondaryAdapterAttempt(db, {
+              companyId: run.companyId, agentId: run.agentId, primaryRunId: run.id,
+              providerStopped: secondaryProviderStopped,
+              completed: secondaryCompleted || hasAcceptedSemanticResult(latestRun.resultJson),
+              failureReason: secondaryFailureReason,
+            });
+          } catch (err) {
+            logger.error({ err, runId: run.id }, "secondary reservation failed; restoring ordinary disposition");
+          }
+        }
         if (secondary) {
           await appendRunEvent(latestRun, { eventType: "lifecycle", stream: "system", level: "info",
             message: "Secondary adapter attempt reserved after provider stop and cleanup",
             payload: { secondaryRunId: secondary.id, reason: secondary.fallbackReason,
-              adapterType: secondary.executionAdapterType } });
+              adapterType: secondary.executionAdapterType } }).catch(err => {
+                logger.warn({ err, runId: run.id }, "failed to record secondary reservation event");
+              });
+          await releaseIssueExecutionAndPromote(latestRun, { suppressImmediateRecovery: true });
+        } else {
+          // Eligibility is only a deferral, not a disposition. Re-read the run:
+          // cancellation, accepted results and reconciliation can win during cleanup.
+          const settled = await getRun(run.id) ?? latestRun;
+          const agent = await getAgent(run.agentId);
+          const accepted = secondaryCompleted || hasAcceptedSemanticResult(settled.resultJson);
+          if (agent && !accepted && settled.status === "failed" && !legacyExecutionNeedsReconciliation(settled)) {
+            if (isMaxTurnExhaustionRun(settled)) {
+              const policy = parseMaxTurnContinuationPolicy(agent);
+              if (policy.enabled && policy.maxAttempts > 0) await scheduleBoundedRetryForRun(settled, agent, {
+                retryReason: MAX_TURN_CONTINUATION_RETRY_REASON,
+                wakeReason: MAX_TURN_CONTINUATION_WAKE_REASON,
+                maxAttempts: policy.maxAttempts, delayMs: policy.delayMs,
+              });
+            } else if (readTransientRecoveryContractFromRun(settled)) {
+              await scheduleBoundedRetryForRun(settled, agent);
+            } else {
+              await scheduleInteractionContinuationInfrastructureRetryIfEligible(settled, agent);
+            }
+          }
+          const conversationSettled = await settleConversationTurn(db, settled);
+          await releaseIssueExecutionAndPromote(settled, { suppressImmediateRecovery: conversationSettled || accepted ||
+            readNonEmptyString(parseObject(settled.contextSnapshot).goalControlRequestId) !== null ||
+            parseObject(settled.contextSnapshot).resumeSessionGoalHeartbeat === true });
+          if (!conversationSettled && !accepted) {
+            await handleIssueReviewPathDisposition(settled);
+            await recovery.reconcileLegacyContinuation(settled.id);
+          }
         }
       }
       // Terminalization precedes lease and adapter cleanup. Only now is the

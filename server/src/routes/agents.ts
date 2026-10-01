@@ -2910,6 +2910,24 @@ export function agentRoutes(
     );
   }
 
+  async function normalizeNewSecondaryConfig(req: Request, companyId: string, agentId: string, input: {
+    name: string; secondaryAdapterType?: string | null; secondaryAdapterConfig?: Record<string, unknown> | null;
+  }) {
+    if (!hasOwn(input, "secondaryAdapterType") && !hasOwn(input, "secondaryAdapterConfig")) return;
+    // Secondary execution is an operator-owned configuration, just like PATCH.
+    assertBoard(req);
+    if (!input.secondaryAdapterType) return;
+    input.secondaryAdapterType = await assertSelectableAdapterType(input.secondaryAdapterType);
+    const config = input.secondaryAdapterConfig ?? {};
+    assertNoAgentAdapterConfigMutation(req, config, "secondaryAdapterConfig");
+    await assertFreshPaperclipRunnerProvider(companyId, input.secondaryAdapterType, config);
+    assertNoNewAgentLegacyPromptTemplate(input.secondaryAdapterType, config);
+    const normalized = applyCodexLocalKeyIsolation(companyId, agentId, input.secondaryAdapterType,
+      applyCreateDefaultsByAdapterType(input.secondaryAdapterType, config));
+    assertExternalInstructionsAdmin(req, { id: agentId, companyId, name: input.name, adapterConfig: normalized });
+    input.secondaryAdapterConfig = normalized;
+  }
+
   function summarizeAgentUpdateDetails(patch: Record<string, unknown>) {
     const changedTopLevelKeys = Object.keys(patch).sort();
     const details: Record<string, unknown> = { changedTopLevelKeys };
@@ -4502,7 +4520,7 @@ export function agentRoutes(
       hireInput.defaultEnvironmentId = caller.defaultEnvironmentId ?? null;
     }
     hireInput.adapterType = await assertSelectableAdapterType(hireInput.adapterType);
-    if (hireInput.secondaryAdapterType) hireInput.secondaryAdapterType = await assertSelectableAdapterType(hireInput.secondaryAdapterType);
+    if (hasOwn(hireInput, "secondaryAdapterType") || hasOwn(hireInput, "secondaryAdapterConfig")) assertBoard(req);
     const rawHireAdapterConfig = (hireInput.adapterConfig ?? {}) as Record<string, unknown>;
     assertProviderTraceSettingTransition(req, hireInput.runtimeConfig);
     await assertFreshPaperclipRunnerProvider(
@@ -4516,6 +4534,7 @@ export function agentRoutes(
     );
     assertNoAgentAdapterConfigMutation(req, rawHireAdapterConfig);
     const hiredAgentId = randomUUID();
+    await normalizeNewSecondaryConfig(req, companyId, hiredAgentId, hireInput);
     const authInheritance = await applyHiringAgentAuthInheritance(
       req,
       companyId,
@@ -4811,7 +4830,7 @@ export function agentRoutes(
       ...createInput
     } = req.body;
     createInput.adapterType = await assertSelectableAdapterType(createInput.adapterType);
-    if (createInput.secondaryAdapterType) createInput.secondaryAdapterType = await assertSelectableAdapterType(createInput.secondaryAdapterType);
+    if (hasOwn(createInput, "secondaryAdapterType") || hasOwn(createInput, "secondaryAdapterConfig")) assertBoard(req);
     const rawCreateAdapterConfig = (createInput.adapterConfig ?? {}) as Record<string, unknown>;
     assertProviderTraceSettingTransition(req, createInput.runtimeConfig);
     await assertFreshPaperclipRunnerProvider(
@@ -4825,6 +4844,7 @@ export function agentRoutes(
     );
     assertNoAgentAdapterConfigMutation(req, rawCreateAdapterConfig);
     const agentId = randomUUID();
+    await normalizeNewSecondaryConfig(req, companyId, agentId, createInput);
     const requestedAdapterConfig = applyCodexLocalKeyIsolation(
       companyId,
       agentId,
