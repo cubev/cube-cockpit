@@ -1,3 +1,6 @@
+import fs from "node:fs";
+import path from "node:path";
+
 const FAVICON_BLOCK_START = "<!-- PAPERCLIP_FAVICON_START -->";
 const FAVICON_BLOCK_END = "<!-- PAPERCLIP_FAVICON_END -->";
 const RUNTIME_BRANDING_BLOCK_START = "<!-- PAPERCLIP_RUNTIME_BRANDING_START -->";
@@ -218,13 +221,34 @@ function replaceMarkedBlock(html: string, startMarker: string, endMarker: string
   return `${before}${indentedContent}${after}`;
 }
 
+/**
+ * Operator theme: a directory holding `theme.css` (and optionally `favicon.svg`
+ * plus any fonts or images the stylesheet references). It is served at
+ * UI_THEME_ROUTE and linked after the bundled styles, so its custom properties
+ * override the built-in tokens without rebuilding the UI.
+ */
+export const UI_THEME_ROUTE = "/ui-theme";
+
+export function getUiThemeDir(env: NodeJS.ProcessEnv = process.env): string | null {
+  const dir = nonEmpty(env.PAPERCLIP_UI_THEME_DIR);
+  return dir && fs.existsSync(path.join(dir, "theme.css")) ? dir : null;
+}
+
 export function applyUiBranding(html: string, env: NodeJS.ProcessEnv = process.env): string {
   const branding = getWorktreeUiBranding(env);
-  const withFavicon = replaceMarkedBlock(html, FAVICON_BLOCK_START, FAVICON_BLOCK_END, renderFaviconLinks(branding));
-  return replaceMarkedBlock(
+  const themeDir = getUiThemeDir(env);
+  // A worktree favicon stays visible over the theme's, it is what tells the instances apart.
+  const favicon = themeDir && !branding.enabled && fs.existsSync(path.join(themeDir, "favicon.svg"))
+    ? `<link rel="icon" href="${UI_THEME_ROUTE}/favicon.svg" type="image/svg+xml" />`
+    : renderFaviconLinks(branding);
+  const withFavicon = replaceMarkedBlock(html, FAVICON_BLOCK_START, FAVICON_BLOCK_END, favicon);
+  const branded = replaceMarkedBlock(
     withFavicon,
     RUNTIME_BRANDING_BLOCK_START,
     RUNTIME_BRANDING_BLOCK_END,
     renderRuntimeBrandingMeta(branding),
   );
+  if (!themeDir) return branded;
+  // Last in <head>, after the bundled stylesheet, so equal-specificity rules in the theme win.
+  return branded.replace("</head>", `  <link rel="stylesheet" href="${UI_THEME_ROUTE}/theme.css" />\n  </head>`);
 }

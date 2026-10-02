@@ -126,7 +126,7 @@ import { remoteAgentProfileRoutes } from "./routes/remote-agent-profiles.js";
 import { pluginUiStaticRoutes } from "./routes/plugin-ui-static.js";
 import { readBrandedStaticIndexHtml } from "./static-index-html.js";
 import { staticUiCacheControl } from "./static-ui-cache.js";
-import { applyUiBranding } from "./ui-branding.js";
+import { applyUiBranding, getUiThemeDir, UI_THEME_ROUTE } from "./ui-branding.js";
 import { logger } from "./middleware/logger.js";
 import {
   DEFAULT_LOCAL_PLUGIN_DIR,
@@ -968,6 +968,9 @@ export async function createApp(
       localPluginDir: opts.localPluginDir ?? DEFAULT_LOCAL_PLUGIN_DIR,
     }),
   );
+
+  const uiThemeDir = getUiThemeDir();
+  if (uiThemeDir) app.use(UI_THEME_ROUTE, express.static(uiThemeDir));
 
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
   if (opts.uiMode === "static") {

@@ -1,3 +1,6 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   applyUiBranding,
@@ -102,5 +105,24 @@ describe("ui branding", () => {
     const defaultHtml = applyUiBranding(TEMPLATE, {});
     expect(defaultHtml).toContain('href="/favicon.svg"');
     expect(defaultHtml).not.toContain('name="paperclip-worktree-name"');
+  });
+
+  it("links an operator theme after the bundled styles and uses its favicon", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ui-theme-"));
+    fs.writeFileSync(path.join(dir, "theme.css"), ":root{}");
+    const env = { PAPERCLIP_UI_THEME_DIR: dir };
+
+    const themed = applyUiBranding(TEMPLATE, env);
+    expect(themed).toMatch(/<link rel="stylesheet" href="\/ui-theme\/theme.css" \/>\s*<\/head>/);
+    expect(themed).toContain('href="/favicon.svg"');
+
+    fs.writeFileSync(path.join(dir, "favicon.svg"), "<svg/>");
+    expect(applyUiBranding(TEMPLATE, env)).toContain('href="/ui-theme/favicon.svg"');
+    expect(applyUiBranding(TEMPLATE, { ...env, PAPERCLIP_IN_WORKTREE: "true" })).not.toContain('href="/ui-theme/favicon.svg"');
+  });
+
+  it("ignores a theme dir without theme.css", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ui-theme-"));
+    expect(applyUiBranding(TEMPLATE, { PAPERCLIP_UI_THEME_DIR: dir })).not.toContain("/ui-theme/");
   });
 });
