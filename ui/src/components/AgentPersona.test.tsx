@@ -45,6 +45,23 @@ describe("agent persona presentation", () => {
     expect(host.textContent).toBe("CS");
     expect(host.querySelector('[role="img"]')?.getAttribute("aria-label")).toBe("Chief of Staff");
   });
+  it("loads theme avatar artwork from the theme path, keeps it still and falls back to the character", async () => {
+    const meta = document.createElement("meta");
+    meta.name = "paperclip-ui-theme-avatars"; meta.content = "true";
+    document.head.appendChild(meta);
+    try {
+      await act(async () => root.render(<><AgentAvatar appearance={appearance} pose="working" size={24} /><AgentCharacter appearance={appearance} /></>));
+      const img = host.querySelector("img")!;
+      expect(img.getAttribute("src")).toBe("/ui-theme/avatars/bubblegum-sky/working.svg");
+      expect(img.getAttribute("srcset")).toBeNull();
+      await show();
+      expect(createCharacter).not.toHaveBeenCalled();
+      await act(async () => { img.dispatchEvent(new Event("error")); });
+      expect(host.querySelector("img")?.getAttribute("src")).toContain("/api/agent-avatars/cap-v1/bubblegum-sky/working.png");
+    } finally {
+      meta.remove();
+    }
+  });
   it("allows only one live character, releases it offscreen and disposes on unmount", async () => {
     await act(async () => root.render(<><AgentCharacter appearance={appearance} /><AgentCharacter appearance={appearance} /></>));
     expect(createCharacter).not.toHaveBeenCalled();

@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type RefObj
 import { resolveAgentAppearance, type CharacterState } from "@paperclipai/shared";
 import { cn } from "@/lib/utils";
 import { characterSlot } from "@/lib/agent-character-slot";
-import { AgentAvatar, avatarSizeClasses, type AgentAvatarProps } from "./AgentAvatar";
+import { AgentAvatar, avatarSizeClasses, hasThemeAvatars, type AgentAvatarProps } from "./AgentAvatar";
 import type { createCharacter } from "@paperclipai/shared/cliplab/runtime";
 
 type Player = ReturnType<typeof createCharacter>;
@@ -21,8 +21,7 @@ export function AgentCharacter({ agent, appearance, size = 256, state = "idle", 
   const owner = useSyncExternalStore(characterSlot.subscribe, characterSlot.getSnapshot, () => null);
   const [visible, setVisible] = useState(false), [reduced, setReduced] = useState(true), [failed, setFailed] = useState(false), [ready, setReady] = useState(false);
   // An operator theme with its own avatar artwork animates in the image itself; keep it instead of the character.
-  const themeAvatars = typeof document !== "undefined" && document.querySelector('meta[name="paperclip-ui-theme-avatars"]') !== null;
-  const active = !themeAvatars && visible && !reduced && !failed && motion === "auto" && state !== "rest";
+  const active = !hasThemeAvatars() && visible && !reduced && !failed && motion === "auto" && state !== "rest";
   useEffect(() => {
     if (typeof matchMedia !== "function" || typeof IntersectionObserver !== "function") return;
     const media = matchMedia("(prefers-reduced-motion: reduce)");
