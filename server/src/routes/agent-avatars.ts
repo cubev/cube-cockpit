@@ -6,6 +6,7 @@ import { AvatarAdmissionError, createAgentAvatarService } from "../services/agen
 import { createStorageProviderFromConfig } from "../storage/provider-registry.js";
 import { loadConfig } from "../config.js";
 import { logger } from "../middleware/logger.js";
+import { getUiThemeAvatarFile } from "../ui-branding.js";
 
 const requestSchema = z.object({
   version: z.literal("cap-v1"),
@@ -34,6 +35,15 @@ export function agentAvatarRoutes(injected?: ReturnType<typeof createAgentAvatar
       res.status(400).json({ error: "Unsupported avatar version, palette, pose, size, or scale" }); return;
     }
     const { palette, pose, size, scale } = parsed.data;
+    const themed = getUiThemeAvatarFile(palette, pose);
+    if (themed) {
+      // Operator artwork can change on redeploy, so revalidate instead of the immutable PNG policy.
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("X-Content-Type-Options", "nosniff");
+      res.setHeader("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'");
+      res.type("image/svg+xml").sendFile(themed);
+      return;
+    }
     try {
       service ??= createAgentAvatarService(createStorageProviderFromConfig(loadConfig()));
       const { stream, byteSize, etag } = await service.get({ appearance: appearanceForPalette(palette === "muted-dream" ? AGENT_PALETTE_IDS[0] : palette), muted: palette === "muted-dream", pose, size: size as AgentAvatarSize, scale: Number(scale) as 1 | 2 }, req.ip || req.socket.remoteAddress || "unknown");

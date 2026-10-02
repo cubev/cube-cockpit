@@ -4,6 +4,7 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   applyUiBranding,
+  getUiThemeAvatarFile,
   getWorktreeUiBranding,
   isWorktreeUiBrandingEnabled,
   renderFaviconLinks,
@@ -119,6 +120,20 @@ describe("ui branding", () => {
     fs.writeFileSync(path.join(dir, "favicon.svg"), "<svg/>");
     expect(applyUiBranding(TEMPLATE, env)).toContain('href="/ui-theme/favicon.svg"');
     expect(applyUiBranding(TEMPLATE, { ...env, PAPERCLIP_IN_WORKTREE: "true" })).not.toContain('href="/ui-theme/favicon.svg"');
+  });
+
+  it("flags theme avatars and resolves their files by palette and pose", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ui-theme-"));
+    fs.writeFileSync(path.join(dir, "theme.css"), ":root{}");
+    const env = { PAPERCLIP_UI_THEME_DIR: dir };
+    expect(applyUiBranding(TEMPLATE, env)).not.toContain("paperclip-ui-theme-avatars");
+    expect(getUiThemeAvatarFile("arctic-blue", "rest", env)).toBeNull();
+
+    fs.mkdirSync(path.join(dir, "avatars", "arctic-blue"), { recursive: true });
+    fs.writeFileSync(path.join(dir, "avatars", "arctic-blue", "rest.svg"), "<svg/>");
+    expect(applyUiBranding(TEMPLATE, env)).toContain('name="paperclip-ui-theme-avatars"');
+    expect(getUiThemeAvatarFile("arctic-blue", "rest", env)).toBe(path.join(dir, "avatars", "arctic-blue", "rest.svg"));
+    expect(getUiThemeAvatarFile("arctic-blue", "idle", env)).toBeNull();
   });
 
   it("ignores a theme dir without theme.css", () => {

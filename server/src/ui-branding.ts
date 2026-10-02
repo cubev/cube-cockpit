@@ -234,6 +234,17 @@ export function getUiThemeDir(env: NodeJS.ProcessEnv = process.env): string | nu
   return dir && fs.existsSync(path.join(dir, "theme.css")) ? dir : null;
 }
 
+/**
+ * Theme artwork for an agent avatar, `<theme>/avatars/<palette>/<pose>.svg`, or null to keep the
+ * built-in character. Callers pass validated palette and pose ids, never raw request input.
+ */
+export function getUiThemeAvatarFile(palette: string, pose: string, env: NodeJS.ProcessEnv = process.env): string | null {
+  const dir = getUiThemeDir(env);
+  if (!dir) return null;
+  const file = path.resolve(dir, "avatars", palette, `${pose}.svg`);
+  return fs.existsSync(file) ? file : null;
+}
+
 export function applyUiBranding(html: string, env: NodeJS.ProcessEnv = process.env): string {
   const branding = getWorktreeUiBranding(env);
   const themeDir = getUiThemeDir(env);
@@ -249,6 +260,10 @@ export function applyUiBranding(html: string, env: NodeJS.ProcessEnv = process.e
     renderRuntimeBrandingMeta(branding),
   );
   if (!themeDir) return branded;
+  // Tells the UI to keep the theme's avatar images instead of starting the animated character.
+  const avatarsMeta = fs.existsSync(path.join(themeDir, "avatars"))
+    ? '  <meta name="paperclip-ui-theme-avatars" content="true" />\n'
+    : "";
   // Last in <head>, after the bundled stylesheet, so equal-specificity rules in the theme win.
-  return branded.replace("</head>", `  <link rel="stylesheet" href="${UI_THEME_ROUTE}/theme.css" />\n  </head>`);
+  return branded.replace("</head>", `${avatarsMeta}  <link rel="stylesheet" href="${UI_THEME_ROUTE}/theme.css" />\n  </head>`);
 }

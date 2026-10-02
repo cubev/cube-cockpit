@@ -20,7 +20,9 @@ export function AgentCharacter({ agent, appearance, size = 256, state = "idle", 
   const slotId = useRef(Symbol("agent-character"));
   const owner = useSyncExternalStore(characterSlot.subscribe, characterSlot.getSnapshot, () => null);
   const [visible, setVisible] = useState(false), [reduced, setReduced] = useState(true), [failed, setFailed] = useState(false), [ready, setReady] = useState(false);
-  const active = visible && !reduced && !failed && motion === "auto" && state !== "rest";
+  // An operator theme with its own avatar artwork animates in the image itself; keep it instead of the character.
+  const themeAvatars = typeof document !== "undefined" && document.querySelector('meta[name="paperclip-ui-theme-avatars"]') !== null;
+  const active = !themeAvatars && visible && !reduced && !failed && motion === "auto" && state !== "rest";
   useEffect(() => {
     if (typeof matchMedia !== "function" || typeof IntersectionObserver !== "function") return;
     const media = matchMedia("(prefers-reduced-motion: reduce)");

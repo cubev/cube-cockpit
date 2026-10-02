@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import { Readable } from "node:stream";
 import { S3Client, PutObjectCommand, HeadObjectCommand, GetObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
@@ -114,6 +114,24 @@ describe("on-demand agent avatars", () => {
     const png = await pool.render(request);
     expect(await sharp(png).metadata()).toMatchObject({ width: 48, height: 48, format: "png", hasAlpha: true });
   }, 20_000);
+  it("serves operator theme artwork instead of rendering when the theme provides it", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "agent-avatar-theme-"));
+    cleanups.push(() => rm(dir, { recursive: true, force: true }));
+    await mkdir(path.join(dir, "avatars", "arctic-blue"), { recursive: true });
+    await writeFile(path.join(dir, "theme.css"), ":root{}");
+    await writeFile(path.join(dir, "avatars", "arctic-blue", "rest.svg"), "<svg xmlns=\"http://www.w3.org/2000/svg\"/>");
+    vi.stubEnv("PAPERCLIP_UI_THEME_DIR", dir);
+    cleanups.push(async () => vi.unstubAllEnvs());
+    const render = vi.fn(async () => Buffer.from("png-bytes"));
+    const url = await serve(createAgentAvatarService(await storage(), render));
+    const response = await fetch(`${url}?size=24`);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toContain("image/svg+xml");
+    expect(response.headers.get("cache-control")).toBe("no-cache");
+    expect(await response.text()).toContain("<svg");
+    expect(render).not.toHaveBeenCalled();
+  });
+
   it("serves public images with content ETags and validates the finite request space", async () => {
     const render = vi.fn(async () => Buffer.from("png-bytes"));
     const url = await serve(createAgentAvatarService(await storage(), render));
