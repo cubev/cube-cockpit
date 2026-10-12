@@ -643,6 +643,7 @@ type SecretConsumerContext = {
 
 type SecretBindingContext = Omit<SecretConsumerContext, "consumerType"> & {
   consumerType: SecretBindingTargetType;
+  configPathPrefix?: "secondaryAdapterConfig." | "";
 };
 
 type SecretResolutionOptions = {
@@ -5160,8 +5161,8 @@ export function secretService(db: Db | DbTransaction) {
             binding.version,
             context
               ? {
-                  bindingContext: { ...context, configPath: `env.${key}` },
-                  accessContext: { ...context, configPath: `env.${key}` },
+                  bindingContext: { ...context, configPath: `${context?.configPathPrefix ?? ""}env.${key}` },
+                  accessContext: { ...context, configPath: `${context?.configPathPrefix ?? ""}env.${key}` },
                 }
               : undefined,
           );
@@ -5180,7 +5181,7 @@ export function secretService(db: Db | DbTransaction) {
             context
               ? {
                   ...context,
-                  configPath: `env.${key}`,
+                  configPath: `${context?.configPathPrefix ?? ""}env.${key}`,
                   responsibleUserId: context.responsibleUserId ?? null,
                 }
               : undefined,
@@ -5212,7 +5213,7 @@ export function secretService(db: Db | DbTransaction) {
         if (!parsed.success) return [];
         const binding = canonicalizeBinding(parsed.data as EnvBinding);
         if (binding.type !== "secret_ref") return [];
-        return [{ key, configPath: `env.${key}`, secretId: binding.secretId }];
+        return [{ key, configPath: `${context?.configPathPrefix ?? ""}env.${key}`, secretId: binding.secretId }];
       });
       const userSecretRefs = Object.entries(record).flatMap(([key, rawBinding]) => {
         if (!ENV_KEY_RE.test(key)) return [];
@@ -5221,7 +5222,7 @@ export function secretService(db: Db | DbTransaction) {
         const binding = canonicalizeBinding(parsed.data as EnvBinding);
         if (binding.type !== "user_secret_ref") return [];
         if (!binding.required || binding.allowMissingOverride) return [];
-        return [{ key, configPath: `env.${key}`, binding }];
+        return [{ key, configPath: `${context?.configPathPrefix ?? ""}env.${key}`, binding }];
       });
       if (secretRefs.length === 0 && userSecretRefs.length === 0) return [];
 
@@ -5370,7 +5371,7 @@ export function secretService(db: Db | DbTransaction) {
         if (!parsed.success) return [];
         const binding = canonicalizeBinding(parsed.data as EnvBinding);
         if (binding.type !== "secret_ref") return [];
-        return [{ key, configPath: key, secretId: binding.secretId }];
+        return [{ key, configPath: `${context.configPathPrefix ?? ""}${key}`, secretId: binding.secretId }];
       });
       const userSecretRefs = secretFieldKeys.flatMap((key) => {
         const parsed = envBindingSchema.safeParse(adapterConfig[key]);
@@ -5378,7 +5379,7 @@ export function secretService(db: Db | DbTransaction) {
         const binding = canonicalizeBinding(parsed.data as EnvBinding);
         if (binding.type !== "user_secret_ref") return [];
         if (!binding.required || binding.allowMissingOverride) return [];
-        return [{ key, configPath: key, binding }];
+        return [{ key, configPath: `${context.configPathPrefix ?? ""}${key}`, binding }];
       });
       if (secretRefs.length === 0 && userSecretRefs.length === 0) return [];
 
@@ -5568,11 +5569,11 @@ export function secretService(db: Db | DbTransaction) {
                         // returns null (no binding enforcement) — preserves today's
                         // undefined-context behavior for a prospective config —
                         // while still carrying the actor via accessContext for audit.
-                        accessContext: { ...context, configPath: `env.${key}` },
+                        accessContext: { ...context, configPath: `${context?.configPathPrefix ?? ""}env.${key}` },
                       }
                     : {
-                        bindingContext: { ...context, configPath: `env.${key}` },
-                        accessContext: { ...context, configPath: `env.${key}` },
+                        bindingContext: { ...context, configPath: `${context?.configPathPrefix ?? ""}env.${key}` },
+                        accessContext: { ...context, configPath: `${context?.configPathPrefix ?? ""}env.${key}` },
                       }
                   : undefined,
               );
@@ -5601,7 +5602,7 @@ export function secretService(db: Db | DbTransaction) {
                       }
                     : {
                         ...context,
-                        configPath: `env.${key}`,
+                        configPath: `${context?.configPathPrefix ?? ""}env.${key}`,
                         responsibleUserId: context.responsibleUserId ?? null,
                       }
                   : undefined,
@@ -5645,7 +5646,7 @@ export function secretService(db: Db | DbTransaction) {
                   }
                 : {
                     ...context,
-                    configPath: key,
+                    configPath: `${context?.configPathPrefix ?? ""}${key}`,
                     responsibleUserId: context.responsibleUserId ?? null,
                   }
               : undefined,
@@ -5666,11 +5667,11 @@ export function secretService(db: Db | DbTransaction) {
               ? {
                   // owner_scoped: omit bindingContext (no binding enforcement),
                   // carry the actor via accessContext for audit only.
-                  accessContext: { ...context, configPath: key },
+                  accessContext: { ...context, configPath: `${context?.configPathPrefix ?? ""}${key}` },
                 }
               : {
-                  bindingContext: { ...context, configPath: key },
-                  accessContext: { ...context, configPath: key },
+                  bindingContext: { ...context, configPath: `${context?.configPathPrefix ?? ""}${key}` },
+                  accessContext: { ...context, configPath: `${context?.configPathPrefix ?? ""}${key}` },
                 }
             : undefined,
         );

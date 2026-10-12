@@ -2692,9 +2692,12 @@ describe("retained native cleanup activation", () => {
     "changed_empty_root",
     "replaced_empty_root",
     "distinct_provider_account",
+    "command_input_digest",
     "wrong_provider_account",
     "wrong_result_digest",
     "wrong_semantic_input",
+    "wrong_command_input_digest",
+    "ambiguous_command_input_digest",
     "wrong_contract",
     "wrong_turn",
     "missing_result_command",
@@ -2927,7 +2930,21 @@ describe("retained native cleanup activation", () => {
               payload: {
                 callId: semantic.callId,
                 operationId: semantic.operationId,
-                input: semanticInput,
+                ...([
+                  "command_input_digest",
+                  "wrong_command_input_digest",
+                  "ambiguous_command_input_digest",
+                ].includes(mode)
+                  ? {
+                      inputDigest:
+                        mode === "wrong_command_input_digest"
+                          ? "0".repeat(64)
+                          : nativeSha256(semanticInput),
+                      ...(mode === "ambiguous_command_input_digest"
+                        ? { input: semanticInput }
+                        : {}),
+                    }
+                  : { input: semanticInput }),
                 correlation,
                 sourceEventId: rawInput.sourceEventId,
                 sourceEventType: rawInput.eventType,
@@ -3189,6 +3206,8 @@ describe("retained native cleanup activation", () => {
           "foreign_event",
           "wrong_result_digest",
           "wrong_semantic_input",
+          "wrong_command_input_digest",
+          "ambiguous_command_input_digest",
           "wrong_contract",
           "wrong_turn",
           "missing_result_command",
@@ -3794,6 +3813,8 @@ describe("retained native cleanup activation", () => {
         "nonempty_root",
         "wrong_result_digest",
         "wrong_semantic_input",
+        "wrong_command_input_digest",
+        "ambiguous_command_input_digest",
         "wrong_contract",
         "wrong_turn",
         "missing_result_command",
@@ -3815,6 +3836,7 @@ describe("retained native cleanup activation", () => {
         "activation_commit_stalled",
         "empty_root",
         "distinct_provider_account",
+        "command_input_digest",
       ].includes(mode);
       expect(outcome.status).toBe(
         succeeds

@@ -2910,6 +2910,24 @@ export function agentRoutes(
     );
   }
 
+  async function normalizeNewSecondaryConfig(req: Request, companyId: string, agentId: string, input: {
+    name: string; secondaryAdapterType?: string | null; secondaryAdapterConfig?: Record<string, unknown> | null;
+  }) {
+    if (!hasOwn(input, "secondaryAdapterType") && !hasOwn(input, "secondaryAdapterConfig")) return;
+    // Secondary execution is an operator-owned configuration, just like PATCH.
+    assertBoard(req);
+    if (!input.secondaryAdapterType) return;
+    input.secondaryAdapterType = await assertSelectableAdapterType(input.secondaryAdapterType);
+    const config = input.secondaryAdapterConfig ?? {};
+    assertNoAgentAdapterConfigMutation(req, config, "secondaryAdapterConfig");
+    await assertFreshPaperclipRunnerProvider(companyId, input.secondaryAdapterType, config);
+    assertNoNewAgentLegacyPromptTemplate(input.secondaryAdapterType, config);
+    const normalized = applyCodexLocalKeyIsolation(companyId, agentId, input.secondaryAdapterType,
+      applyCreateDefaultsByAdapterType(input.secondaryAdapterType, config));
+    assertExternalInstructionsAdmin(req, { id: agentId, companyId, name: input.name, adapterConfig: normalized });
+    input.secondaryAdapterConfig = normalized;
+  }
+
   function summarizeAgentUpdateDetails(patch: Record<string, unknown>) {
     const changedTopLevelKeys = Object.keys(patch).sort();
     const details: Record<string, unknown> = { changedTopLevelKeys };
@@ -3122,6 +3140,7 @@ export function agentRoutes(
     return {
       ...agent,
       adapterConfig: {},
+      secondaryAdapterConfig: null,
       runtimeConfig: {},
     };
   }
@@ -3130,14 +3149,14 @@ export function agentRoutes(
   // views blank the config wholesale for authorization reasons; this runs for
   // config-reading (board) callers too, so plaintext `adapterConfig.env` values
   // never leave the API regardless of actor scope.
-  function redactAgentRowForResponse<T extends { adapterConfig?: unknown } | null | undefined>(
+  function redactAgentRowForResponse<T extends { adapterConfig?: unknown; secondaryAdapterConfig?: unknown } | null | undefined>(
     agent: T,
   ): T {
     if (!agent || typeof agent !== "object") return agent;
-    if (!agent.adapterConfig || typeof agent.adapterConfig !== "object") return agent;
     return {
       ...agent,
-      adapterConfig: redactAgentAdapterConfig(agent.adapterConfig as Record<string, unknown>),
+      adapterConfig: redactAgentAdapterConfig((agent.adapterConfig ?? {}) as Record<string, unknown>),
+      secondaryAdapterConfig: agent.secondaryAdapterConfig ? redactAgentAdapterConfig(agent.secondaryAdapterConfig as Record<string, unknown>) : null,
     };
   }
 
@@ -3153,6 +3172,8 @@ export function agentRoutes(
       reportsTo: agent.reportsTo,
       adapterType: agent.adapterType,
       adapterConfig: redactAgentAdapterConfig(agent.adapterConfig),
+      secondaryAdapterType: agent.secondaryAdapterType,
+      secondaryAdapterConfig: agent.secondaryAdapterConfig ? redactAgentAdapterConfig(agent.secondaryAdapterConfig) : null,
       runtimeConfig: redactEventPayload(agent.runtimeConfig),
       permissions: agent.permissions,
       updatedAt: agent.updatedAt,
@@ -4499,6 +4520,7 @@ export function agentRoutes(
       hireInput.defaultEnvironmentId = caller.defaultEnvironmentId ?? null;
     }
     hireInput.adapterType = await assertSelectableAdapterType(hireInput.adapterType);
+    if (hasOwn(hireInput, "secondaryAdapterType") || hasOwn(hireInput, "secondaryAdapterConfig")) assertBoard(req);
     const rawHireAdapterConfig = (hireInput.adapterConfig ?? {}) as Record<string, unknown>;
     assertProviderTraceSettingTransition(req, hireInput.runtimeConfig);
     await assertFreshPaperclipRunnerProvider(
@@ -4512,6 +4534,7 @@ export function agentRoutes(
     );
     assertNoAgentAdapterConfigMutation(req, rawHireAdapterConfig);
     const hiredAgentId = randomUUID();
+    await normalizeNewSecondaryConfig(req, companyId, hiredAgentId, hireInput);
     const authInheritance = await applyHiringAgentAuthInheritance(
       req,
       companyId,
@@ -4807,6 +4830,7 @@ export function agentRoutes(
       ...createInput
     } = req.body;
     createInput.adapterType = await assertSelectableAdapterType(createInput.adapterType);
+    if (hasOwn(createInput, "secondaryAdapterType") || hasOwn(createInput, "secondaryAdapterConfig")) assertBoard(req);
     const rawCreateAdapterConfig = (createInput.adapterConfig ?? {}) as Record<string, unknown>;
     assertProviderTraceSettingTransition(req, createInput.runtimeConfig);
     await assertFreshPaperclipRunnerProvider(
@@ -4820,6 +4844,7 @@ export function agentRoutes(
     );
     assertNoAgentAdapterConfigMutation(req, rawCreateAdapterConfig);
     const agentId = randomUUID();
+    await normalizeNewSecondaryConfig(req, companyId, agentId, createInput);
     const requestedAdapterConfig = applyCodexLocalKeyIsolation(
       companyId,
       agentId,
@@ -5408,6 +5433,25 @@ export function agentRoutes(
     }
 
     const patchData = { ...(req.body as Record<string, unknown>) };
+    if (hasOwn(patchData, "secondaryAdapterType") || hasOwn(patchData, "secondaryAdapterConfig")) {
+      assertBoard(req);
+      await assertCanUpdateAgent(req, existing);
+      assertExternalInstructionsAdmin(req, existing);
+      const secondaryType = hasOwn(patchData, "secondaryAdapterType")
+        ? patchData.secondaryAdapterType : existing.secondaryAdapterType;
+      if (secondaryType != null) {
+        const knownType = assertKnownAdapterType(secondaryType as string);
+        if (knownType !== existing.secondaryAdapterType) await assertSelectableAdapterType(knownType);
+      }
+      const secondaryConfig = asRecord(patchData.secondaryAdapterConfig);
+      if (secondaryConfig) {
+        assertNoAgentAdapterConfigMutation(req, secondaryConfig);
+        if (adapterConfigTouchesInstructionsConfig(secondaryConfig)) await assertCanManageInstructionsPath(req, existing);
+        if (secondaryType === existing.secondaryAdapterType) {
+          patchData.secondaryAdapterConfig = restoreRedactedAgentEnv(secondaryConfig, asRecord(existing.secondaryAdapterConfig) ?? {});
+        }
+      }
+    }
     const replaceAdapterConfig = patchData.replaceAdapterConfig === true;
     delete patchData.replaceAdapterConfig;
     // The apply-existing flag is not an agent column. The server binds the fixed

@@ -179,6 +179,8 @@ describeEmbeddedPostgres("direct adapter native-runner isolation", () => {
         signal: null,
         runtimeMode: "legacy",
         nativePhase: null,
+        executionAdapterType: adapterType,
+        executionModel: `test-${provider}`,
       });
       const persistedResult = finished?.resultJson as Record<
         string,

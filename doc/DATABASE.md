@@ -253,6 +253,38 @@ Triage writes serialize on the company and attention-source identity so concurre
 
 ## Native runner persistence
 
+Secondary adapter configuration uses nullable `agents.secondary_adapter_type`
+and `secondary_adapter_config` columns. Historical agents remain unconfigured.
+The agent create/hire/update API accepts these fields and normalizes secondary
+configuration through the same secret and provider-profile rules as primary
+configuration. Clearing the secondary adapter also clears its configuration.
+Secondary secret bindings and user-secret declarations use the
+`secondaryAdapterConfig.` path prefix, keeping identical primary and secondary
+environment keys separate. API responses redact both configurations and
+restricted views omit both. These configuration surfaces alone do not enable
+runtime fallback.
+
+`heartbeat_runs.fallback_of_run_id` records server-owned attempt lineage,
+separately from generic retries and wake context. A partial unique index admits
+at most one secondary run per predecessor; a composite foreign key binds both
+runs to the same company and agent, and a check rejects self-links. Runtime
+scheduling must still reject chains, verify provider shutdown and completion,
+and claim lineage with the issue execution lock in one transaction. The database
+constraint alone is not fallback authorization. Delete related runs together
+when cleaning up an agent/company. Nullable `execution_adapter_type` and
+`execution_model` record the selected execution configuration, while
+`fallback_reason` records the switch reason without credentials. The heartbeat
+captures the resolved adapter and configured model before dispatch and replaces
+the model with the provider-reported model on completion. The run drill-down
+shows this immutable execution metadata and links the fallback predecessor.
+The internal attempt reservation serializes on the primary row and creates the
+secondary run and wake in one transaction. It refuses secondary/retry ancestors,
+accepted native results, unconfirmed provider stops and paused agents. Reserved
+attempts choose their adapter before normal admission and secret resolution;
+secondary secrets use the secondary path prefix. Primary runtime sessions and
+task sessions are never passed to or overwritten by a secondary attempt.
+Automatic failure-to-reservation dispatch is still pending integration.
+
 Native runner state is additive to the existing heartbeat tables. Every existing
 `heartbeat_runs` row defaults to `runtime_mode = 'legacy'`; adding these columns
 does not select the native runtime or start a runner process. Native execution can
@@ -472,3 +504,37 @@ reservation cannot silently disappear. Failed cleanup or an ambiguous storage
 write requires operator reconciliation before an unattached reservation is
 removed. The table stores no response bodies. See `doc/runner-api-tools.md` for
 limits and the operator override.
+
+Secondary execution is reserved after a legacy provider-stop callback and the
+executor's cleanup boundary. Adapter-owned error codes select the failure reason;
+setup, workspace restoration, accepted results, cancellation and unconfirmed
+stop do not authorize replay. The reservation also rejects an existing generic
+retry successor. Native safe replacement can reserve the same secondary lineage
+only after its existing action, workspace, history and ownership proofs pass;
+remote secondary replacement additionally requires bound termination receipts.
+A secondary lineage cannot schedule a generic retry or another native replacement.
+
+Configured secondary adapters also make native quota and allowlisted exhausted
+process/timeout failures eligible for safe-replacement inspection. These extra
+candidates require the stopped-session verifier; a failure code alone does not
+authorize replacement. Same-run native resumes do not consume the single
+persisted secondary attempt. A local bootstrap that never authenticated can
+also be verified using its exact controller identity, zero connections, untouched
+bootstrap commands, no harness/provider-home directory, no checkpoint or PRP
+events, and a bound process-stop receipt. State changes invalidate that proof.
+Unconfigured agents retain their existing replacement budget. Budget hard stops
+still pause the agent before reservation. Scheduled secondary attempts participate
+in the existing issue retry inspection and immediate-promotion path.
+
+Secondary adapter fields on agent hire/create are board-only, matching agent
+PATCH. The secondary creation configuration receives fresh-provider, legacy
+prompt, external-instructions and Codex API-key home-isolation checks. Hire
+approval activation preserves the pending agent's validated secondary settings;
+it cannot introduce secondary settings from an approval payload. An omitted
+secondary adapter type has no default.
+
+Legacy secondary reservation transfers the issue execution lock to its queued
+successor in the same transaction. A competing execution owner or reassignment
+rejects reservation. The primary executor defers issue release until that decision
+and restores ordinary retry, review and continuation disposition when no
+secondary is reserved, including reservation errors and skipped attempts.

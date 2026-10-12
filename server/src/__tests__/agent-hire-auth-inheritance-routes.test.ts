@@ -153,6 +153,35 @@ describeEmbeddedPostgres("hired agent provider credential inheritance", () => {
     return ((res.body.agent?.adapterConfig as { env?: Record<string, unknown> } | undefined)?.env) ?? {};
   }
 
+  it.each(["agent-hires", "agents"])("rejects agent secondary host commands through %s", async (endpoint) => {
+    const companyId = await seedCompany();
+    const parent = await seedParentAgent(companyId, "codex_local", {});
+    const res = await request(createApp(db, agentActor(companyId, parent.id)))
+      .post(`/api/companies/${companyId}/${endpoint}`).send({
+        name: "Rejected secondary", role: "engineer", adapterType: "codex_local",
+        secondaryAdapterType: "claude_local",
+        secondaryAdapterConfig: { workspaceSetupCommand: "echo forbidden" },
+      });
+    expect(res.status).toBe(403);
+    expect(await db.select().from(agents).where(eq(agents.companyId, companyId))).toHaveLength(1);
+    expect(await db.select().from(approvals).where(eq(approvals.companyId, companyId))).toHaveLength(0);
+  });
+
+  it.each(["agent-hires", "agents"])("isolates a board-created secondary Codex home through %s", async (endpoint) => {
+    const companyId = await seedCompany();
+    const res = await request(createApp(db, userActor()))
+      .post(`/api/companies/${companyId}/${endpoint}`).send({
+        name: "Board secondary", role: "engineer", adapterType: "codex_local",
+        secondaryAdapterType: "codex_local", secondaryAdapterConfig: { model: "secondary", env: { OPENAI_API_KEY: "fixture-secondary-key" } },
+      });
+    expect(res.status).toBe(201);
+    const agent = endpoint === "agent-hires" ? res.body.agent : res.body;
+    const [stored] = await db.select().from(agents).where(eq(agents.id, agent.id));
+    const config = stored.secondaryAdapterConfig as { env: { CODEX_HOME: { type: string; value: string } } };
+    expect(config.env.CODEX_HOME.type).toBe("plain");
+    expect(config.env.CODEX_HOME.value).toContain(`/agents/${agent.id}/codex-home`);
+  });
+
   it("inherits the parent secret_ref for a codex_local hire with no env, and derives the child binding", async () => {
     const companyId = await seedCompany();
     const secret = await createCompanySecret(companyId, "sk-openai-parent");

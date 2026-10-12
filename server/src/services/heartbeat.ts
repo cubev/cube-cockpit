@@ -1,3 +1,5 @@
+import { secondaryAdapterFailureReason, type SecondaryAdapterFailureReason } from "./secondary-adapter-fallback.js";
+import { reserveSecondaryAdapterAttempt, resolveSecondaryExecutionAgent } from "./secondary-adapter-attempts.js";
 import { isAiAuthenticationBlocked } from "./ai-auth-failure.js";
 import { CHAT_COMPLETION_WAKE_REASON, prepareChatCompletionTurn, chatCompletionInstruction, isCompletedOnboardingHandoffWake } from "./chat-completion-delivery.js";
 import { AgentDirectoryReuseInvalidatedError, isAgentDirectoryCopy } from "./agent-directory-working-copies.js";
@@ -1556,6 +1558,7 @@ export async function resolveExecutionRunAdapterConfig(input: {
   companyId: string;
   agentId?: string | null;
   adapterType?: string | null;
+  configPathPrefix?: "secondaryAdapterConfig." | "";
   issueId?: string | null;
   heartbeatRunId?: string | null;
   responsibleUserId?: string | null;
@@ -1667,6 +1670,7 @@ export async function resolveExecutionRunAdapterConfig(input: {
           {
             consumerType: "agent",
             consumerId: input.agentId,
+            configPathPrefix: input.configPathPrefix,
             responsibleUserId: input.responsibleUserId ?? null,
           },
         )),
@@ -1683,6 +1687,7 @@ export async function resolveExecutionRunAdapterConfig(input: {
             {
               consumerType: "agent",
               consumerId: input.agentId,
+              configPathPrefix: input.configPathPrefix,
               responsibleUserId: input.responsibleUserId ?? null,
             },
           )),
@@ -1796,6 +1801,7 @@ export async function resolveExecutionRunAdapterConfig(input: {
       ? {
           consumerType: "agent",
           consumerId: input.agentId,
+          configPathPrefix: input.configPathPrefix,
           actorType: "agent",
           actorId: input.agentId,
           responsibleUserId: input.responsibleUserId ?? null,
@@ -15286,6 +15292,12 @@ export function heartbeatService(
       delayMs?: number;
     },
   ) {
+    const [secondarySuccessor] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+      .where(eq(heartbeatRuns.fallbackOfRunId, run.id)).limit(1);
+    if (run.fallbackOfRunId || secondarySuccessor) {
+      return { outcome: "not_scheduled" as const, reason: "The secondary adapter attempt exhausted this execution lineage.",
+        errorCode: "secondary_adapter_attempt_exhausted" as const, issueId: readNonEmptyString(run.contextSnapshot?.issueId) };
+    }
     if (Array.isArray(run.contextSnapshot?.chatCompletionDeliveryIds) &&
         run.contextSnapshot.chatCompletionDeliveryIds.some(id => typeof id === "string")) {
       return { outcome: "not_scheduled" as const, reason: "The completion outbox owns this reply's retry budget and publication identity.",
@@ -16445,7 +16457,7 @@ export function heartbeatService(
           eq(heartbeatRuns.companyId, companyId),
           inArray(heartbeatRuns.status, statuses),
           sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
-          sql`${heartbeatRuns.retryOfRunId} is not null`,
+          or(isNotNull(heartbeatRuns.retryOfRunId), isNotNull(heartbeatRuns.fallbackOfRunId)),
         ),
       )
       .orderBy(
@@ -17227,12 +17239,19 @@ export function heartbeatService(
     companyAgents?: AgentOrgRow[],
   ) {
     if (run.status !== "queued") return run;
-    const agent = await getAgent(run.agentId);
-    if (!agent) {
+    const storedAgent = await getAgent(run.agentId);
+    if (!storedAgent) {
       await cancelRunInternal(
         run.id,
         "Cancelled because the agent no longer exists",
       );
+      return null;
+    }
+    let agent: typeof agents.$inferSelect;
+    try {
+      agent = await resolveSecondaryExecutionAgent(db, storedAgent, run);
+    } catch (error) {
+      await cancelRunInternal(run.id, error instanceof Error ? error.message : "Secondary execution identity changed");
       return null;
     }
     const invokability = companyAgents
@@ -19844,11 +19863,13 @@ export function heartbeatService(
     await db
       .update(agentRuntimeState)
       .set({
-        adapterType: agent.adapterType,
-        sessionId: session.legacySessionId,
-        lastRunId: run.id,
-        lastRunStatus: run.status,
-        lastError: run.error ?? null,
+        ...(!run.fallbackOfRunId ? {
+          adapterType: agent.adapterType,
+          sessionId: session.legacySessionId,
+          lastRunId: run.id,
+          lastRunStatus: run.status,
+          lastError: run.error ?? null,
+        } : {}),
         totalInputTokens: sql`${agentRuntimeState.totalInputTokens} + ${inputTokens}`,
         totalOutputTokens: sql`${agentRuntimeState.totalOutputTokens} + ${outputTokens}`,
         totalCachedInputTokens: sql`${agentRuntimeState.totalCachedInputTokens} + ${cachedInputTokens}`,
@@ -20187,6 +20208,11 @@ export function heartbeatService(
     }
 
     let legacyAdapterEntered = false;
+    let secondaryFailureReason: SecondaryAdapterFailureReason | null = null;
+    let secondaryProviderStopped = false;
+    let secondaryCompleted = false;
+    let secondaryConfigured = false;
+    let secondaryDispositionDeferred = false;
     let run = await getRun(runId);
     if (!run) return;
     if (run.status !== "queued" && run.status !== "running") return;
@@ -20320,8 +20346,9 @@ export function heartbeatService(
     let readFailureReportSecrets: () => string[] = () => [];
 
     try {
-      const agent = await getAgent(run.agentId);
-      if (!agent) {
+      const storedAgent = await getAgent(run.agentId);
+      secondaryConfigured = Boolean(storedAgent?.secondaryAdapterType) && !run.fallbackOfRunId && !run.retryOfRunId;
+      if (!storedAgent) {
         await setRunStatus(runId, "failed", {
           error: "Agent not found",
           errorCode: "agent_not_found",
@@ -20336,6 +20363,7 @@ export function heartbeatService(
         return;
       }
 
+      const agent = await resolveSecondaryExecutionAgent(db, storedAgent, run);
       // The claimed adapter identity is immutable recovery evidence. Do not
       // execute a newly selected adapter under a previous adapter's claim.
       const selectedAdapter = claimedAdapterType(run);
@@ -20368,8 +20396,17 @@ export function heartbeatService(
         await finalizeAgentStatus(agent.id, "succeeded");
         return;
       }
-      const runtime = await ensureRuntimeState(agent);
+      const storedRuntime = await ensureRuntimeState(storedAgent);
+      const runtime = run.fallbackOfRunId
+        ? { ...storedRuntime, adapterType: agent.adapterType, sessionId: null, stateJson: {} }
+        : storedRuntime;
       const context = parseObject(run.contextSnapshot);
+      if (run.fallbackOfRunId) {
+        delete context.resumeSessionParams;
+        delete context.resumeSessionDisplayId;
+        delete context.executionContinuation;
+        delete context.resumeFromRunId;
+      }
       const authorizeFailedChatRetryExecution = () =>
         db.transaction((tx) =>
           authorizeFailedChatRunRetryWake(db, tx as unknown as Db, {
@@ -20778,7 +20815,7 @@ export function heartbeatService(
         context.executionPolicy = retainedTrust.executionPolicy;
       }
       const config = parseObject(agent.adapterConfig);
-      const taskSession = taskKey
+      const taskSession = taskKey && !run.fallbackOfRunId
         ? await getTaskSession(
             agent.companyId,
             agent.id,
@@ -21442,7 +21479,7 @@ export function heartbeatService(
       });
       const mergedConfig = {
         ...workspaceManagedConfig,
-        ...(issueAssigneeOverrides?.adapterConfig ?? {}),
+        ...(!run.fallbackOfRunId ? issueAssigneeOverrides?.adapterConfig ?? {} : {}),
       };
       const configSnapshot = buildExecutionWorkspaceConfigSnapshot(
         mergedConfig,
@@ -21486,6 +21523,7 @@ export function heartbeatService(
           adapterType: agent.adapterType,
           issueId,
           heartbeatRunId: run.id,
+          configPathPrefix: run.fallbackOfRunId ? "secondaryAdapterConfig." : "",
           environmentId: selectedEnvironmentForConfig?.id ?? null,
           environmentEnv: aiBinding ? stripAiAuthBindings(selectedEnvironmentForConfig?.envVars) : selectedEnvironmentForConfig?.envVars ?? null,
           environmentDriver: selectedEnvironmentForConfig?.driver ?? null,
@@ -21666,6 +21704,19 @@ export function heartbeatService(
         });
       const configuredModel =
         readConfiguredModelFromAdapterConfig(runtimeConfig);
+      // Capture the resolved execution identity rather than today's editable
+      // agent configuration. This is local run metadata, never telemetry.
+      await db.update(heartbeatRuns).set({
+        executionAdapterType: agent.adapterType,
+        executionModel: configuredModel,
+        updatedAt: new Date(),
+      }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "running")));
+      await appendRunEvent(run, {
+        eventType: "lifecycle", stream: "system", level: "info",
+        message: "Execution adapter selected",
+        payload: { adapterType: agent.adapterType, model: configuredModel,
+          fallbackOfRunId: run.fallbackOfRunId, fallbackReason: run.fallbackReason },
+      });
       const wakeSessionResetReason = describeSessionResetReason(context);
       const sessionConfigFreshness = resolveTaskSessionConfigFreshness({
         hasTaskSession: taskSession != null,
@@ -22494,6 +22545,7 @@ export function heartbeatService(
               : saved.errorMessage ?? "Instruction edits were not saved."), payload: instructionSave });
       };
       const collectStoppedInstructions = async () => {
+        secondaryProviderStopped = true;
         if (!instructionCopy) return;
         let saved = await instructionCopies.collectStopped({ companyId: agent.companyId, runId: run.id, target: executionTarget });
         // Capture before disposal. Exhausted bounded collection leaves a durable
@@ -24519,7 +24571,7 @@ export function heartbeatService(
                         companyId: agent.companyId,
                         agentId: agent.id,
                         adapterType: agent.adapterType,
-                        taskKey,
+                        taskKey: run.fallbackOfRunId ? `secondary:${taskKey}` : taskKey,
                         sessionParamsJson: params,
                         sessionDisplayId: displayId,
                         lastRunId: run.id,
@@ -24783,6 +24835,13 @@ export function heartbeatService(
             if (!guardedDispatch.dispatched) return;
             adapterResult = await guardedDispatch.resultPromise;
           }
+          // Preserve execution evidence before restore/copy-back/finalization can
+          // transform the result or throw. A successful turn must never replay.
+          secondaryCompleted = Boolean(adapterResult.nativeFinalization) ||
+            hasAcceptedSemanticResult(adapterResult.resultJson) ||
+            (!adapterResult.timedOut && (adapterResult.exitCode ?? 0) === 0 &&
+              !adapterResult.signal && !adapterResult.errorMessage && !adapterResult.errorCode);
+          secondaryFailureReason = secondaryAdapterFailureReason(adapterResult);
           if (instructionSave) adapterResult.resultJson = { ...adapterResult.resultJson, instructionSave };
           adapterResult = applyWorkspaceRestoreFailure(adapterResult);
           // A returned result can include a failed restore. Keep the workspace
@@ -25300,6 +25359,8 @@ export function heartbeatService(
 
         const finalRunPatch: Partial<typeof heartbeatRuns.$inferInsert> = {
           finishedAt: new Date(),
+          executionAdapterType: agent.adapterType,
+          executionModel: adapterResult.model ?? configuredModel,
           error: runErrorMessage,
           errorCode: runErrorCode,
           exitCode: adapterResult.exitCode,
@@ -25559,7 +25620,13 @@ export function heartbeatService(
               `[paperclip] Failed to resolve run presentation: ${err instanceof Error ? err.message : String(err)}\n`,
             );
           }
-          if (outcome === "failed" && isMaxTurnExhaustionRun(livenessRun)) {
+          secondaryDispositionDeferred = secondaryConfigured && secondaryProviderStopped &&
+            !secondaryCompleted && secondaryFailureReason !== null &&
+            !legacyExecutionNeedsReconciliation(livenessRun) && livenessRun.runtimeMode !== "native" && ["failed", "timed_out"].includes(livenessRun.status);
+          if (secondaryDispositionDeferred || run.fallbackOfRunId || (secondaryConfigured && secondaryCompleted)) {
+            // The secondary lineage owns this execution budget. Reserve only
+            // after cleanup; never open a competing generic retry here.
+          } else if (outcome === "failed" && isMaxTurnExhaustionRun(livenessRun)) {
             const policy = parseMaxTurnContinuationPolicy(agent);
             if (policy.enabled && policy.maxAttempts > 0) {
               await scheduleBoundedRetryForRun(livenessRun, agent, {
@@ -25601,15 +25668,15 @@ export function heartbeatService(
             resolvedPresentationDecision,
           );
           const conversationSettled = await settleConversationTurn(db, livenessRun);
-          await releaseIssueExecutionAndPromote(livenessRun, {
-            suppressImmediateRecovery: conversationSettled ||
+          if (!secondaryDispositionDeferred) await releaseIssueExecutionAndPromote(livenessRun, {
+            suppressImmediateRecovery: secondaryDispositionDeferred || Boolean(run.fallbackOfRunId) || (secondaryConfigured && secondaryCompleted && outcome !== "succeeded") || conversationSettled ||
               readNonEmptyString(
                 parseObject(livenessRun.contextSnapshot).goalControlRequestId,
               ) !== null ||
               parseObject(livenessRun.contextSnapshot)
                 .resumeSessionGoalHeartbeat === true,
           });
-          if (!conversationSettled) {
+          if (!conversationSettled && !secondaryDispositionDeferred && !run.fallbackOfRunId && !(secondaryConfigured && secondaryCompleted && outcome !== "succeeded")) {
             await handleIssueReviewPathDisposition(livenessRun);
             if (livenessRun.runtimeMode !== "native") {
               await recovery.reconcileLegacyContinuation(livenessRun.id);
@@ -25711,7 +25778,7 @@ export function heartbeatService(
                 companyId: agent.companyId,
                 agentId: agent.id,
                 adapterType: agent.adapterType,
-                taskKey,
+                taskKey: run.fallbackOfRunId ? `secondary:${taskKey}` : taskKey,
                 sessionParamsJson:
                   attachPaperclipSessionMetadataToSessionParams(
                     nextSessionState.params,
@@ -26012,18 +26079,20 @@ export function heartbeatService(
           ) {
             await finalizeIssueCommentPolicy(livenessRun, agent);
           }
-          await scheduleInteractionContinuationInfrastructureRetryIfEligible(
-            livenessRun,
-            agent,
-          );
-          await releaseIssueExecutionAndPromote(livenessRun, {
+          secondaryDispositionDeferred = secondaryConfigured && secondaryProviderStopped &&
+            !secondaryCompleted && secondaryFailureReason !== null &&
+            !legacyExecutionNeedsReconciliation(livenessRun) && livenessRun.runtimeMode !== "native" && livenessRun.status === "failed";
+          if (!secondaryDispositionDeferred && !run.fallbackOfRunId) {
+            await scheduleInteractionContinuationInfrastructureRetryIfEligible(livenessRun, agent);
+          }
+          if (!secondaryDispositionDeferred) await releaseIssueExecutionAndPromote(livenessRun, {
             // Native recovery owns the original heartbeat run through
             // exhaustion. Once its durable coordinator has classified a
             // terminal failure, generic issue recovery must not create a
             // replacement retryOfRunId chain for the same provider work.
-            suppressImmediateRecovery: nativeTerminalFailureCode !== null,
+            suppressImmediateRecovery: secondaryDispositionDeferred || Boolean(run.fallbackOfRunId) || nativeTerminalFailureCode !== null,
           });
-          await handleIssueReviewPathDisposition(livenessRun);
+          if (!secondaryDispositionDeferred) await handleIssueReviewPathDisposition(livenessRun);
 
           await updateRuntimeState(
             agent,
@@ -26050,7 +26119,7 @@ export function heartbeatService(
               companyId: agent.companyId,
               agentId: agent.id,
               adapterType: agent.adapterType,
-              taskKey,
+              taskKey: run.fallbackOfRunId ? `secondary:${taskKey}` : taskKey,
               sessionParamsJson:
                 goalCheckpointSession.current?.params ??
                 attachPaperclipSessionMetadataToSessionParams(
@@ -26519,6 +26588,59 @@ export function heartbeatService(
         executionControl.finish();
         if (adapterExecutionControls.get(run.id) === executionControl) {
           adapterExecutionControls.delete(run.id);
+        }
+      }
+      if (secondaryDispositionDeferred && latestRun) {
+        let secondary: Awaited<ReturnType<typeof reserveSecondaryAdapterAttempt>> = null;
+        if (!shutdownInProgress && !nativeSessionResumeScheduled && !nativeWorkspaceFinalizeScheduled &&
+            !nativeOwnershipHeld && !executionControl.controller.signal.aborted) {
+          try {
+            secondary = await reserveSecondaryAdapterAttempt(db, {
+              companyId: run.companyId, agentId: run.agentId, primaryRunId: run.id,
+              providerStopped: secondaryProviderStopped,
+              completed: secondaryCompleted || hasAcceptedSemanticResult(latestRun.resultJson),
+              failureReason: secondaryFailureReason,
+            });
+          } catch (err) {
+            logger.error({ err, runId: run.id }, "secondary reservation failed; restoring ordinary disposition");
+          }
+        }
+        if (secondary) {
+          await appendRunEvent(latestRun, { eventType: "lifecycle", stream: "system", level: "info",
+            message: "Secondary adapter attempt reserved after provider stop and cleanup",
+            payload: { secondaryRunId: secondary.id, reason: secondary.fallbackReason,
+              adapterType: secondary.executionAdapterType } }).catch(err => {
+                logger.warn({ err, runId: run.id }, "failed to record secondary reservation event");
+              });
+          await releaseIssueExecutionAndPromote(latestRun, { suppressImmediateRecovery: true });
+        } else {
+          // Eligibility is only a deferral, not a disposition. Re-read the run:
+          // cancellation, accepted results and reconciliation can win during cleanup.
+          const settled = await getRun(run.id) ?? latestRun;
+          const agent = await getAgent(run.agentId);
+          const accepted = secondaryCompleted || hasAcceptedSemanticResult(settled.resultJson);
+          if (agent && !accepted && settled.status === "failed" && !legacyExecutionNeedsReconciliation(settled)) {
+            if (isMaxTurnExhaustionRun(settled)) {
+              const policy = parseMaxTurnContinuationPolicy(agent);
+              if (policy.enabled && policy.maxAttempts > 0) await scheduleBoundedRetryForRun(settled, agent, {
+                retryReason: MAX_TURN_CONTINUATION_RETRY_REASON,
+                wakeReason: MAX_TURN_CONTINUATION_WAKE_REASON,
+                maxAttempts: policy.maxAttempts, delayMs: policy.delayMs,
+              });
+            } else if (readTransientRecoveryContractFromRun(settled)) {
+              await scheduleBoundedRetryForRun(settled, agent);
+            } else {
+              await scheduleInteractionContinuationInfrastructureRetryIfEligible(settled, agent);
+            }
+          }
+          const conversationSettled = await settleConversationTurn(db, settled);
+          await releaseIssueExecutionAndPromote(settled, { suppressImmediateRecovery: conversationSettled || accepted ||
+            readNonEmptyString(parseObject(settled.contextSnapshot).goalControlRequestId) !== null ||
+            parseObject(settled.contextSnapshot).resumeSessionGoalHeartbeat === true });
+          if (!conversationSettled && !accepted) {
+            await handleIssueReviewPathDisposition(settled);
+            await recovery.reconcileLegacyContinuation(settled.id);
+          }
         }
       }
       // Terminalization precedes lease and adapter cleanup. Only now is the

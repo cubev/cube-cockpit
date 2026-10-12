@@ -1,8 +1,11 @@
+import { hasRemoteTerminationReceipt } from "../remote-execution-termination.js";
+import { reserveSecondaryAdapterAttempt } from "../secondary-adapter-attempts.js";
 import { logger } from "../../middleware/logger.js";
 import { createHash, randomUUID } from "node:crypto";
 import { stat } from "node:fs/promises";
 import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import {
+  agents,
   agentWakeupRequests,
   environmentLeases,
   heartbeatRunEvents,
@@ -13,6 +16,7 @@ import {
   toolInvocations,
   type Db,
 } from "@paperclipai/db";
+import { nativeSha256 } from "./canonical.js";
 import { decideNativeReplacement } from "./native-replacement-evidence.js";
 import { issueService } from "../issues.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
@@ -57,10 +61,12 @@ export async function reconcileSafeNativeReplacements(
     .where(
       and(
         eq(heartbeatRuns.status, "failed"),
+        isNull(heartbeatRuns.fallbackOfRunId),
         eq(nativeRunFinalizations.phase, "terminal_failure"),
         inArray(
           nativeRunFinalizations.failureCode,
-          ["native_provider_terminal_failed", "native_session_cleanup_quarantined", "provider_transport_failed"],
+          ["native_provider_terminal_failed", "native_session_cleanup_quarantined", "provider_transport_failed",
+            "native_provider_usage_limit", "native_session_retry_exhausted"],
         ),
         isNull(nativeRunFinalizations.resultId),
         sql`coalesce(${nativeRunFinalizations.failureDetail}->>'successorRunId', '') = ''`,
@@ -76,6 +82,17 @@ export async function reconcileSafeNativeReplacements(
         coordinator.failureDetail?.replacementDenied
       )
         continue;
+      const [configuredAgent] = await db.select().from(agents).where(and(
+        eq(agents.id, run.agentId), eq(agents.companyId, run.companyId),
+      ));
+      const secondaryOnlyCandidate = ["native_provider_usage_limit", "native_session_retry_exhausted"].includes(coordinator.failureCode ?? "");
+      if (secondaryOnlyCandidate && !configuredAgent?.secondaryAdapterType) continue;
+      if (configuredAgent?.secondaryAdapterType && run.retryOfRunId) continue;
+      const sourceFailure = coordinator.failureDetail?.originalFailureCode;
+      if (coordinator.failureCode === "native_session_retry_exhausted" &&
+          !["provider_initialize_timeout", "provider_request_timeout", "provider_process_exited",
+            "provider_stdout_closed", "provider_process_output_closed", "provider_process_status_failed",
+            "provider_transport_failed", "native_runner_process_exited"].includes(String(sourceFailure))) continue;
       const execution = record(
         record(run.runnerProfileJson).nativeExecutionInput,
       );
@@ -91,7 +108,9 @@ export async function reconcileSafeNativeReplacements(
         );
       // Teardown is still in progress. The next sweep rechecks its durable outcome.
       if (leases.some((lease) => lease.releasedAt === null)) continue;
-      const stoppedSession = coordinator.failureCode !== "native_provider_terminal_failed"
+      if (configuredAgent?.secondaryAdapterType && leases.some(lease =>
+          lease.provider !== "local" && !hasRemoteTerminationReceipt(lease))) continue;
+      const stoppedSession = (coordinator.failureCode !== "native_provider_terminal_failed" || configuredAgent?.secondaryAdapterType)
         ? await options.verifyStoppedSession?.(run) ?? null : null;
       // A transport label alone is not evidence. Keep inspecting these candidates
       // as process cleanup and the final transcript become durable.
@@ -226,7 +245,10 @@ export async function reconcileSafeNativeReplacements(
         effectInventoryComplete:
           Boolean(stoppedSession) || (record(run.runnerProfileJson).recoveryEventInventoryVersion === 1 &&
           record(execution.provider).kind === "codex"),
-        attempts: coordinator.attempt,
+        // Same-run native resumes consumed the native recovery budget, not
+        // the separately persisted, single secondary attempt. Reservation
+        // rejects any existing fallback or generic successor atomically.
+        attempts: configuredAgent?.secondaryAdapterType ? 1 : coordinator.attempt,
         invocations,
         apiReceipts: record(record(run.resultJson).apiToolReceipts),
         uncertainProviderActions,
@@ -316,6 +338,11 @@ export async function reconcileSafeNativeReplacements(
           .from(nativeRunFinalizations)
           .where(eq(nativeRunFinalizations.runId, run.id))
           .for("update");
+        const [executionAgent] = await tx.select().from(agents).where(and(
+          eq(agents.id, run.agentId), eq(agents.companyId, run.companyId),
+        ));
+        const useSecondary = Boolean(executionAgent?.secondaryAdapterType);
+        if ((secondaryOnlyCandidate || stoppedSession?.evidence.schema === "paperclip.stopped_native_bootstrap.v1") && !useSecondary) return false;
         if (
           !task ||
           task.assigneeAgentId !== run.agentId ||
@@ -327,7 +354,7 @@ export async function reconcileSafeNativeReplacements(
           current.failureCode !== coordinator.failureCode ||
           current.failureDetail?.successorRunId ||
           current.failureDetail?.replacementDenied ||
-          current.attempt >= 3
+          (!useSecondary && current.attempt >= 3)
         )
           return false;
         if (task.status === "blocked") {
@@ -350,6 +377,24 @@ export async function reconcileSafeNativeReplacements(
           )).for("update");
           if (!currentRun || currentRun.status !== "failed" || currentRun.runnerInstanceId !== run.runnerInstanceId ||
               currentRun.nativeSessionId !== run.nativeSessionId || currentRun.processPid || currentRun.processGroupId) return false;
+          if (stoppedSession.evidence.schema === "paperclip.stopped_native_bootstrap.v1") {
+            if (nativeSha256(currentRun.runnerProfileJson) !== nativeSha256(run.runnerProfileJson)) return false;
+            const [lateEvent] = await tx.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents).where(and(
+              eq(heartbeatRunEvents.companyId, run.companyId), eq(heartbeatRunEvents.runId, run.id),
+              sql`${heartbeatRunEvents.sourceEventId} is not null`,
+            )).limit(1);
+            if (lateEvent) return false;
+          }
+        }
+        // An automatic retry already consumed the primary failure's budget.
+        // It cannot manufacture a new primary -> secondary pair.
+        if (useSecondary && run.retryOfRunId) return false;
+        if (useSecondary) {
+          const currentLeases = await tx.select().from(environmentLeases).where(and(
+            eq(environmentLeases.companyId, run.companyId), eq(environmentLeases.heartbeatRunId, run.id),
+          ));
+          if (currentLeases.some(lease => lease.releasedAt === null ||
+              (lease.provider !== "local" && !hasRemoteTerminationReceipt(lease)))) return false;
         }
         if (task.status === "blocked") {
           // Restore only this failure's unchanged projection. The normal issue
@@ -361,12 +406,23 @@ export async function reconcileSafeNativeReplacements(
           if (!stoppedSession.retire()) throw new Error("native_replacement_stopped_session_changed");
           await appendHeartbeatRunEvent(tx as unknown as Db, {
             companyId: run.companyId, runId: run.id, agentId: run.agentId,
-            eventType: "native.stopped_text_turn_verified", stream: "system", level: "info",
-            message: "The previous runner and provider stopped. The interrupted turn had no external actions; any completion bookkeeping has a verified receipt.",
+            eventType: stoppedSession.evidence.schema === "paperclip.stopped_native_bootstrap.v1"
+              ? "native.stopped_bootstrap_verified" : "native.stopped_text_turn_verified", stream: "system", level: "info",
+            message: "The previous runner stopped and the verified execution inventory permits a fresh attempt.",
             payload: stoppedSession.evidence,
           });
         }
-        const successorRunId = randomUUID();
+        const secondary = useSecondary ? await reserveSecondaryAdapterAttempt(tx as unknown as Db, {
+          companyId: run.companyId, agentId: run.agentId, primaryRunId: run.id,
+          providerStopped: true, completed: false, failureReason:
+            current.failureCode === "native_provider_usage_limit" ? "quota" :
+              ["authentication_failed", "login_required", "codex_auth_required", "acpx_auth_required", "claude_auth_required"].includes(String(current.failureDetail?.originalFailureCode))
+                ? "authentication" :
+              ["provider_initialize_timeout", "provider_request_timeout"].includes(String(current.failureDetail?.originalFailureCode))
+                ? "timeout" : "provider",
+        }) : null;
+        if (useSecondary && !secondary) throw new Error("secondary_native_attempt_not_admitted");
+        const successorRunId = secondary?.id ?? randomUUID();
         const dueAt = new Date(now.getTime() + 30_000);
         const predecessorContext = { ...record(run.contextSnapshot) };
         // History comes from the failed source run. Consumed wake fields must
@@ -387,41 +443,49 @@ export async function reconcileSafeNativeReplacements(
           recoveryIncidentRootRunId:
             record(run.contextSnapshot).recoveryIncidentRootRunId ?? run.id,
         };
-        const [wake] = await tx
-          .insert(agentWakeupRequests)
-          .values({
+        if (secondary) {
+          await tx.update(heartbeatRuns).set({
+            status: "scheduled_retry", scheduledRetryAt: dueAt,
+            scheduledRetryReason: "secondary_adapter_fallback",
+          }).where(eq(heartbeatRuns.id, secondary.id));
+          options.failpoint?.("successor_inserted");
+        } else {
+          const [wake] = await tx
+            .insert(agentWakeupRequests)
+            .values({
+              companyId: run.companyId,
+              agentId: run.agentId,
+              source: "automation",
+              triggerDetail: "system",
+              reason: NATIVE_SAFE_REPLACEMENT_REASON,
+              status: "queued",
+              payload: context,
+              requestedByActorType: "system",
+              idempotencyKey: `native-safe-replacement:${run.id}`,
+            })
+            .returning();
+          await tx.insert(heartbeatRuns).values({
+            id: successorRunId,
             companyId: run.companyId,
             agentId: run.agentId,
-            source: "automation",
+            invocationSource: "automation",
             triggerDetail: "system",
-            reason: NATIVE_SAFE_REPLACEMENT_REASON,
-            status: "queued",
-            payload: context,
-            requestedByActorType: "system",
-            idempotencyKey: `native-safe-replacement:${run.id}`,
-          })
-          .returning();
-        await tx.insert(heartbeatRuns).values({
-          id: successorRunId,
-          companyId: run.companyId,
-          agentId: run.agentId,
-          invocationSource: "automation",
-          triggerDetail: "system",
-          status: "scheduled_retry",
-          executionStatusDeliveryId: randomUUID(),
-          wakeupRequestId: wake!.id,
-          responsibleUserId: run.responsibleUserId,
-          contextSnapshot: context,
-          retryOfRunId: run.id,
-          scheduledRetryAt: dueAt,
-          scheduledRetryAttempt: current.attempt,
-          scheduledRetryReason: NATIVE_SAFE_REPLACEMENT_REASON,
-        });
-        options.failpoint?.("successor_inserted");
-        await tx
-          .update(agentWakeupRequests)
-          .set({ runId: successorRunId })
-          .where(eq(agentWakeupRequests.id, wake!.id));
+            status: "scheduled_retry",
+            executionStatusDeliveryId: randomUUID(),
+            wakeupRequestId: wake!.id,
+            responsibleUserId: run.responsibleUserId,
+            contextSnapshot: context,
+            retryOfRunId: run.id,
+            scheduledRetryAt: dueAt,
+            scheduledRetryAttempt: current.attempt,
+            scheduledRetryReason: NATIVE_SAFE_REPLACEMENT_REASON,
+          });
+          options.failpoint?.("successor_inserted");
+          await tx
+            .update(agentWakeupRequests)
+            .set({ runId: successorRunId })
+            .where(eq(agentWakeupRequests.id, wake!.id));
+        }
         await tx
           .update(nativeRunFinalizations)
           .set({

@@ -12,6 +12,8 @@ import {
   boolean,
   unique,
   uniqueIndex,
+  foreignKey,
+  check,
 } from "drizzle-orm/pg-core";
 import { companies } from "./companies.js";
 import { agents } from "./agents.js";
@@ -41,6 +43,11 @@ export const heartbeatRuns = pgTable(
     signal: text("signal"),
     usageJson: jsonb("usage_json").$type<Record<string, unknown>>(),
     resultJson: jsonb("result_json").$type<Record<string, unknown>>(),
+    // Server-owned lineage, distinct from caller-controlled wake context and retries.
+    fallbackOfRunId: uuid("fallback_of_run_id"),
+    fallbackReason: text("fallback_reason"),
+    executionAdapterType: text("execution_adapter_type"),
+    executionModel: text("execution_model"),
     runtimeMode: text("runtime_mode").notNull().default("legacy"),
     runtimeModeResolverVersion: text("runtime_mode_resolver_version"),
     runtimeModeReason: text("runtime_mode_reason"),
@@ -98,6 +105,17 @@ export const heartbeatRuns = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    companyAgentRunUq: unique("heartbeat_runs_company_agent_run_uq")
+      .on(table.companyId, table.agentId, table.id),
+    fallbackPredecessorUq: uniqueIndex("heartbeat_runs_fallback_predecessor_uq")
+      .on(table.fallbackOfRunId).where(sql`${table.fallbackOfRunId} is not null`),
+    fallbackPredecessorFk: foreignKey({
+      name: "heartbeat_runs_fallback_predecessor_fk",
+      columns: [table.companyId, table.agentId, table.fallbackOfRunId],
+      foreignColumns: [table.companyId, table.agentId, table.id],
+    }),
+    fallbackNotSelf: check("heartbeat_runs_fallback_not_self",
+      sql`${table.fallbackOfRunId} is null or ${table.fallbackOfRunId} <> ${table.id}`),
     executionStatusDeliveryIdx: index("heartbeat_runs_execution_status_delivery_idx")
       .on(table.executionStatusDeliveryId).where(sql`${table.executionStatusDeliveryId} is not null`),
     executionControlDeadlineIdx: index("heartbeat_runs_execution_control_deadline_idx")
